@@ -560,11 +560,13 @@ void processCommandLine(int argc, char **argv) {
     OPT_SYSTEM_LIBRARY = 14,
     OPT_PORT = 15,
     OPT_TOKENIZER = 16,
-    OPT_PATCH = 17
+    OPT_PATCH = 17,
+    OPT_LISTEN_ALL = 18
   };
   static struct pal::Option s_longOptions[] = {
       {"help", pal::no_argument, NULL, OPT_HELP},
       {"port", pal::required_argument, NULL, OPT_PORT},
+      {"listen_all", pal::no_argument, NULL, OPT_LISTEN_ALL},
       {"text_embedding_size", pal::required_argument, NULL,
        OPT_TEXT_EMBEDDING_SIZE},
       {"cpu", pal::no_argument, NULL, OPT_USE_MNN},
@@ -652,6 +654,9 @@ void processCommandLine(int argc, char **argv) {
         break;
       case OPT_PORT:
         port = std::stoi(pal::g_optArg);
+        break;
+      case OPT_LISTEN_ALL:
+        listen_address = "0.0.0.0";
         break;
       case OPT_TOKENIZER:
         tokenizerPath = pal::g_optArg;
@@ -3261,6 +3266,15 @@ int main(int argc, char **argv) {
 
   // --- HTTP Server ---
   httplib::Server svr;
+  svr.set_default_headers({
+      {"Access-Control-Allow-Origin", "*"},
+      {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
+      {"Access-Control-Allow-Headers", "Content-Type, Authorization"},
+      {"Access-Control-Max-Age", "86400"},
+  });
+  svr.Options(R"(.*)", [](const httplib::Request &, httplib::Response &res) {
+    res.status = 204;
+  });
   svr.Get("/health", [](const httplib::Request &, httplib::Response &res) {
     res.status = 200;
   });
@@ -3527,7 +3541,6 @@ int main(int argc, char **argv) {
       res.set_header("Content-Type", "text/event-stream");
       res.set_header("Cache-Control", "no-cache");
       res.set_header("Connection", "keep-alive");
-      res.set_header("Access-Control-Allow-Origin", "*");
       res.set_chunked_content_provider(
           "text/event-stream", [&](intptr_t, httplib::DataSink &sink) -> bool {
             try {
@@ -3589,7 +3602,6 @@ int main(int argc, char **argv) {
             {"type", "request_error"}}}};
       res.status = 400;
       res.set_content(err.dump(), "application/json");
-      res.set_header("Access-Control-Allow-Origin", "*");
     } catch (const std::invalid_argument &e) {
       nlohmann::json err = {
           {"error",
@@ -3597,7 +3609,6 @@ int main(int argc, char **argv) {
             {"type", "request_error"}}}};
       res.status = 400;
       res.set_content(err.dump(), "application/json");
-      res.set_header("Access-Control-Allow-Origin", "*");
     } catch (const std::exception &e) {
       nlohmann::json err = {
           {"error",
@@ -3605,7 +3616,6 @@ int main(int argc, char **argv) {
             {"type", "server_error"}}}};
       res.status = 500;
       res.set_content(err.dump(), "application/json");
-      res.set_header("Access-Control-Allow-Origin", "*");
     }
   });
 
@@ -3742,7 +3752,6 @@ int main(int argc, char **argv) {
       res.set_header("X-Output-Width", std::to_string(final_width));
       res.set_header("X-Output-Height", std::to_string(final_height));
       res.set_header("X-Duration-Ms", std::to_string(duration));
-      res.set_header("Access-Control-Allow-Origin", "*");
       res.set_header("Access-Control-Expose-Headers",
                      "X-Output-Width,X-Output-Height,X-Duration-Ms");
 
@@ -3760,7 +3769,6 @@ int main(int argc, char **argv) {
             {"type", "request_error"}}}};
       res.status = 400;
       res.set_content(err.dump(), "application/json");
-      res.set_header("Access-Control-Allow-Origin", "*");
     } catch (const std::exception &e) {
       tempUpscalerApp.reset();
       nlohmann::json err = {
@@ -3769,13 +3777,11 @@ int main(int argc, char **argv) {
             {"type", "server_error"}}}};
       res.status = 500;
       res.set_content(err.dump(), "application/json");
-      res.set_header("Access-Control-Allow-Origin", "*");
     }
   });
 
   svr.Post("/tokenize", [&](const httplib::Request &req,
                             httplib::Response &res) {
-    res.set_header("Access-Control-Allow-Origin", "*");
     try {
       auto json = nlohmann::json::parse(req.body);
       std::string text = json.value("prompt", std::string());
