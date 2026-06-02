@@ -32,7 +32,6 @@ class TagAutocompleteRepository private constructor(private val context: Context
     private val mainFile = File(dictDir, MAIN_FILE_NAME)
     private val translationFile = File(dictDir, TRANSLATION_FILE_NAME)
     private val cacheFile = File(dictDir, CACHE_FILE_NAME)
-    private val underscoreRegex = Regex("_+")
 
     private val _state = MutableStateFlow(readStateFromDisk())
     val state: StateFlow<DictionaryState> = _state.asStateFlow()
@@ -173,12 +172,32 @@ class TagAutocompleteRepository private constructor(private val context: Context
 
     private fun loadData(): TagData? {
         if (!mainFile.exists()) return null
-        val entries = loadEntriesFromCache() ?: run {
+        val cached = loadEntriesFromCache()
+        val entries: List<TagEntry>
+        val englishBitmaps: LongArray
+        if (cached != null) {
+            entries = cached.first
+            englishBitmaps = cached.second
+        } else {
             val parsed = parseCsvEntries() ?: return null
-            saveEntriesToCache(parsed)
-            parsed
+            englishBitmaps = computeEnglishBitmaps(parsed)
+            saveEntriesToCache(parsed, englishBitmaps)
+            entries = parsed
         }
-        return buildIndexes(entries)
+        return buildIndexes(entries, englishBitmaps)
+    }
+
+    // One presence bitmap per entry, covering the english name and every alias,
+    // so the pre-filter can reject an entry for both fields at once.
+    private fun computeEnglishBitmaps(entries: List<TagEntry>): LongArray {
+        val bitmaps = LongArray(entries.size * CharBitmap.WORDS)
+        for (i in entries.indices) {
+            val offset = i * CharBitmap.WORDS
+            val entry = entries[i]
+            CharBitmap.addInto(bitmaps, offset, entry.normalizedEnglish)
+            for (alias in entry.normalizedAliases) CharBitmap.addInto(bitmaps, offset, alias)
+        }
+        return bitmaps
     }
 
     private fun parseCsvEntries(): List<TagEntry>? {
@@ -226,10 +245,12 @@ class TagAutocompleteRepository private constructor(private val context: Context
         return entries
     }
 
-    private fun buildIndexes(entries: List<TagEntry>): TagData {
+    private fun buildIndexes(entries: List<TagEntry>, englishBitmaps: LongArray): TagData {
+        // The head buckets are only consulted by the edit-distance correction
+        // fallback; fuzzy matching itself scans the full entry list because a
+        // query char may land anywhere in the target.
         val englishByHead = HashMap<Char, MutableList<TagEntry>>(64)
         val aliasByHead = HashMap<Char, MutableList<AliasRef>>(64)
-        val translationByHead = HashMap<Char, MutableList<TagEntry>>(64)
         val translationEntries = ArrayList<TagEntry>(entries.size)
 
         for (entry in entries) {
@@ -241,10 +262,18 @@ class TagAutocompleteRepository private constructor(private val context: Context
                     aliasByHead.getOrPut(head) { mutableListOf() } += AliasRef(entry, alias)
                 }
             }
-            val normTr = entry.normalizedTranslation
-            if (!normTr.isNullOrEmpty()) {
+            if (!entry.normalizedTranslation.isNullOrEmpty()) {
                 translationEntries += entry
-                translationByHead.getOrPut(normTr.first()) { mutableListOf() } += entry
+            }
+        }
+
+        // Translation bitmaps are derived here rather than cached: the set is a
+        // subset of all entries and recomputing them from the (already cached)
+        // normalized translations costs only a couple of milliseconds.
+        val translationBitmaps = LongArray(translationEntries.size * CharBitmap.WORDS)
+        for (i in translationEntries.indices) {
+            translationEntries[i].normalizedTranslation?.let { normalized ->
+                CharBitmap.addInto(translationBitmaps, i * CharBitmap.WORDS, normalized)
             }
         }
 
@@ -253,7 +282,8 @@ class TagAutocompleteRepository private constructor(private val context: Context
             englishByHead = englishByHead,
             aliasByHead = aliasByHead,
             translationEntries = translationEntries,
-            translationByHead = translationByHead,
+            englishBitmaps = englishBitmaps,
+            translationBitmaps = translationBitmaps,
         )
     }
 
@@ -277,7 +307,7 @@ class TagAutocompleteRepository private constructor(private val context: Context
         return map
     }
 
-    private fun loadEntriesFromCache(): List<TagEntry>? {
+    private fun loadEntriesFromCache(): Pair<List<TagEntry>, LongArray>? {
         if (!cacheFile.exists()) return null
         return runCatching {
             DataInputStream(BufferedInputStream(cacheFile.inputStream())).use { input ->
@@ -341,7 +371,9 @@ class TagAutocompleteRepository private constructor(private val context: Context
                         normalizedTranslation = normalizedTranslation,
                     )
                 }
-                list
+                val bitmaps = LongArray(count * CharBitmap.WORDS)
+                for (k in bitmaps.indices) bitmaps[k] = input.readLong()
+                list to bitmaps
             }
         }.getOrElse {
             cacheFile.delete()
@@ -349,7 +381,7 @@ class TagAutocompleteRepository private constructor(private val context: Context
         }
     }
 
-    private fun saveEntriesToCache(entries: List<TagEntry>) {
+    private fun saveEntriesToCache(entries: List<TagEntry>, englishBitmaps: LongArray) {
         runCatching {
             DataOutputStream(BufferedOutputStream(cacheFile.outputStream())).use { output ->
                 output.writeInt(CACHE_MAGIC)
@@ -383,6 +415,7 @@ class TagAutocompleteRepository private constructor(private val context: Context
                         output.writeBoolean(false)
                     }
                 }
+                for (value in englishBitmaps) output.writeLong(value)
             }
         }.onFailure {
             cacheFile.delete()
@@ -401,137 +434,153 @@ class TagAutocompleteRepository private constructor(private val context: Context
     }
 
     private fun suggestByTranslation(data: TagData, normalizedQuery: String, limit: Int): List<TagSuggestion> {
-        if (normalizedQuery.isEmpty()) return emptyList()
-        val head = normalizedQuery.first()
-        val prefix = mutableListOf<TagSuggestion>()
+        if (normalizedQuery.isEmpty() || limit <= 0) return emptyList()
+        val pattern = normalizedQuery.toCharArray()
+        val queryBitmap = CharBitmap.of(normalizedQuery)
+        val q0 = queryBitmap[0]
+        val q1 = queryBitmap[1]
 
-        for (entry in data.translationByHead[head].orEmpty()) {
-            val normalized = entry.normalizedTranslation ?: continue
-            if (!normalized.startsWith(normalizedQuery)) continue
-            val scoreBase = popularityScore(entry.postCount)
-            prefix += TagSuggestion(
+        val entries = data.translationEntries
+        val bitmaps = data.translationBitmaps
+        val topK = TopKLongs(limit)
+        for (i in entries.indices) {
+            if (!CharBitmap.contains(bitmaps, i * CharBitmap.WORDS, q0, q1)) continue
+            val normalized = entries[i].normalizedTranslation ?: continue
+            val fuzzyScore = FuzzyMatcher.score(pattern, normalized)
+            if (fuzzyScore == FuzzyMatcher.NO_MATCH) continue
+            topK.offer(fuzzyScore + popularityBonus(entries[i].postCount), i)
+        }
+
+        val results = ArrayList<TagSuggestion>(limit)
+        topK.forEach { score, index ->
+            val entry = entries[index]
+            results += TagSuggestion(
                 replacementTag = entry.english,
                 primaryText = entry.english,
                 secondaryText = entry.translation,
                 matchType = TagMatchType.Translation,
                 category = entry.category,
                 postCount = entry.postCount,
-                score = 5000 + scoreBase - normalized.length,
+                score = score,
             )
         }
 
-        val contains = if (prefix.size < limit) {
-            val collector = mutableListOf<TagSuggestion>()
-            for (entry in data.translationEntries) {
-                val normalized = entry.normalizedTranslation ?: continue
-                if (normalized.startsWith(normalizedQuery)) continue
-                val idx = normalized.indexOf(normalizedQuery)
-                if (idx < 0) continue
-                val scoreBase = popularityScore(entry.postCount)
-                collector += TagSuggestion(
-                    replacementTag = entry.english,
-                    primaryText = entry.english,
-                    secondaryText = entry.translation,
-                    matchType = TagMatchType.Translation,
-                    category = entry.category,
-                    postCount = entry.postCount,
-                    score = 4200 + scoreBase - idx,
-                )
-            }
-            collector
-        } else {
-            emptyList()
-        }
-
-        return (prefix + contains)
-            .distinctBy { it.replacementTag }
+        return results
             .sortedWith(compareByDescending<TagSuggestion> { it.score }.thenByDescending { it.postCount })
             .take(limit)
     }
 
     private fun suggestByEnglish(data: TagData, normalizedQuery: String, limit: Int): List<TagSuggestion> {
-        if (normalizedQuery.isEmpty()) return emptyList()
-        val head = normalizedQuery.first()
-        val prefix = mutableListOf<TagSuggestion>()
-        val alias = mutableListOf<TagSuggestion>()
-        val correction = mutableListOf<TagSuggestion>()
+        if (normalizedQuery.isEmpty() || limit <= 0) return emptyList()
+        val pattern = normalizedQuery.toCharArray()
+        val queryBitmap = CharBitmap.of(normalizedQuery)
+        val q0 = queryBitmap[0]
+        val q1 = queryBitmap[1]
 
-        val englishCandidates = data.englishByHead[head].orEmpty()
-        val aliasCandidates = data.aliasByHead[head].orEmpty()
-
-        for (entry in englishCandidates) {
-            if (!entry.normalizedEnglish.startsWith(normalizedQuery)) continue
-            val scoreBase = popularityScore(entry.postCount)
-            prefix += buildSuggestion(
-                entry,
-                TagMatchType.Prefix,
-                6000 + scoreBase - entry.normalizedEnglish.length,
-            )
-        }
-
-        val seenAliasEntries = HashSet<String>()
-        for (ref in aliasCandidates) {
-            if (!ref.alias.startsWith(normalizedQuery)) continue
-            if (ref.entry.normalizedEnglish.startsWith(normalizedQuery)) continue
-            if (!seenAliasEntries.add(ref.entry.english)) continue
-            val scoreBase = popularityScore(ref.entry.postCount)
-            alias += buildSuggestion(
-                ref.entry,
-                TagMatchType.Alias,
-                5200 + scoreBase - ref.alias.length,
-                ref.alias,
-            )
-        }
-
-        if (prefix.size + alias.size < limit) {
-            val threshold = correctionThreshold(normalizedQuery.length)
-            val correctionCandidates = HashSet<TagEntry>()
-            correctionCandidates += englishCandidates
-            for (ref in aliasCandidates) correctionCandidates += ref.entry
-
-            for (entry in correctionCandidates) {
-                if (entry.normalizedEnglish.startsWith(normalizedQuery)) continue
-
-                val englishDistance =
-                    if (abs(entry.normalizedEnglish.length - normalizedQuery.length) <= threshold &&
-                        entry.normalizedEnglish.firstOrNull() == head
-                    ) {
-                        damerauLevenshtein(normalizedQuery, entry.normalizedEnglish, threshold)
-                    } else {
-                        threshold + 1
-                    }
-                var bestDistance = englishDistance
-                var matchedAlias: String? = null
-
-                if (bestDistance > threshold) {
-                    for (aliasValue in entry.normalizedAliases) {
-                        if (abs(aliasValue.length - normalizedQuery.length) > threshold) continue
-                        if (aliasValue.firstOrNull() != head) continue
-                        val aliasDistance =
-                            damerauLevenshtein(normalizedQuery, aliasValue, threshold)
-                        if (aliasDistance < bestDistance) {
-                            bestDistance = aliasDistance
-                            matchedAlias = aliasValue
-                        }
-                    }
-                }
-
-                if (bestDistance <= threshold) {
-                    val scoreBase = popularityScore(entry.postCount)
-                    correction += buildSuggestion(
-                        entry,
-                        TagMatchType.Correction,
-                        3600 + scoreBase - bestDistance * 100,
-                        matchedAlias,
-                    )
-                }
+        // The bitmap pre-filter rejects entries that cannot contain every query
+        // char before the O(len) subsequence scan; the bounded top-K heap keeps
+        // only the best [limit] so short queries don't build thousands of rows.
+        val entries = data.entries
+        val bitmaps = data.englishBitmaps
+        val topK = TopKLongs(limit)
+        for (i in entries.indices) {
+            if (!CharBitmap.contains(bitmaps, i * CharBitmap.WORDS, q0, q1)) continue
+            val entry = entries[i]
+            var best = FuzzyMatcher.score(pattern, entry.normalizedEnglish)
+            for (alias in entry.normalizedAliases) {
+                val aliasScore = FuzzyMatcher.score(pattern, alias)
+                if (aliasScore > best) best = aliasScore
             }
+            if (best == FuzzyMatcher.NO_MATCH) continue
+            topK.offer(best + popularityBonus(entry.postCount), i)
         }
 
-        return (prefix + alias + correction)
-            .distinctBy { it.replacementTag }
+        val results = ArrayList<TagSuggestion>(limit + limit)
+        val matched = HashSet<String>()
+        topK.forEach { score, index ->
+            val entry = entries[index]
+            results += buildEnglishSuggestion(entry, pattern, score)
+            matched += entry.english
+        }
+
+        // Subsequence matching cannot catch transposed/substituted letters, so
+        // when fuzzy hits are scarce we top up with edit-distance corrections.
+        if (results.size < limit) {
+            appendCorrections(data, normalizedQuery, matched, results)
+        }
+
+        return results
             .sortedWith(compareByDescending<TagSuggestion> { it.score }.thenByDescending { it.postCount })
             .take(limit)
+    }
+
+    // Re-derives which field (name vs alias) drove the score for one of the few
+    // top-K survivors, to label the row and choose its secondary text.
+    private fun buildEnglishSuggestion(entry: TagEntry, pattern: CharArray, score: Int): TagSuggestion {
+        val englishScore = FuzzyMatcher.score(pattern, entry.normalizedEnglish)
+        var aliasScore = FuzzyMatcher.NO_MATCH
+        var aliasValue: String? = null
+        for (alias in entry.normalizedAliases) {
+            val candidateScore = FuzzyMatcher.score(pattern, alias)
+            if (candidateScore > aliasScore) {
+                aliasScore = candidateScore
+                aliasValue = alias
+            }
+        }
+        return if (englishScore >= aliasScore) {
+            buildSuggestion(entry, TagMatchType.Prefix, score)
+        } else {
+            buildSuggestion(entry, TagMatchType.Alias, score, aliasValue)
+        }
+    }
+
+    private fun appendCorrections(
+        data: TagData,
+        normalizedQuery: String,
+        matched: Set<String>,
+        out: MutableList<TagSuggestion>,
+    ) {
+        val head = normalizedQuery.first()
+        val threshold = correctionThreshold(normalizedQuery.length)
+        val candidates = HashSet<TagEntry>()
+        candidates += data.englishByHead[head].orEmpty()
+        for (ref in data.aliasByHead[head].orEmpty()) candidates += ref.entry
+
+        for (entry in candidates) {
+            if (entry.english in matched) continue
+
+            val englishDistance =
+                if (abs(entry.normalizedEnglish.length - normalizedQuery.length) <= threshold &&
+                    entry.normalizedEnglish.firstOrNull() == head
+                ) {
+                    damerauLevenshtein(normalizedQuery, entry.normalizedEnglish, threshold)
+                } else {
+                    threshold + 1
+                }
+            var bestDistance = englishDistance
+            var matchedAlias: String? = null
+
+            if (bestDistance > threshold) {
+                for (aliasValue in entry.normalizedAliases) {
+                    if (abs(aliasValue.length - normalizedQuery.length) > threshold) continue
+                    if (aliasValue.firstOrNull() != head) continue
+                    val aliasDistance = damerauLevenshtein(normalizedQuery, aliasValue, threshold)
+                    if (aliasDistance < bestDistance) {
+                        bestDistance = aliasDistance
+                        matchedAlias = aliasValue
+                    }
+                }
+            }
+
+            if (bestDistance <= threshold) {
+                out += buildSuggestion(
+                    entry,
+                    TagMatchType.Correction,
+                    CORRECTION_BASE - bestDistance * CORRECTION_DISTANCE_PENALTY + popularityBonus(entry.postCount),
+                    matchedAlias,
+                )
+            }
+        }
     }
 
     private fun buildSuggestion(
@@ -541,7 +590,7 @@ class TagAutocompleteRepository private constructor(private val context: Context
         aliasValue: String? = null,
     ): TagSuggestion {
         val secondary = when (matchType) {
-            TagMatchType.Alias -> aliasValue?.replace('_', ' ')
+            TagMatchType.Alias -> aliasValue?.let(::tagUnderscoresToSpaces)
             else -> entry.translation
         }
         return TagSuggestion(
@@ -578,54 +627,16 @@ class TagAutocompleteRepository private constructor(private val context: Context
         return validRows
     }
 
-    private fun parseCsvLine(line: String): List<String> {
-        val result = mutableListOf<String>()
-        val current = StringBuilder()
-        var inQuotes = false
-        var index = 0
-
-        while (index < line.length) {
-            val char = line[index]
-            when {
-                char == '"' -> {
-                    if (inQuotes && index + 1 < line.length && line[index + 1] == '"') {
-                        current.append('"')
-                        index++
-                    } else {
-                        inQuotes = !inQuotes
-                    }
-                }
-
-                char == ',' && !inQuotes -> {
-                    result += current.toString()
-                    current.setLength(0)
-                }
-
-                else -> current.append(char)
-            }
-            index++
-        }
-        result += current.toString()
-        return result
-    }
-
-    private fun normalizeTranslation(value: String): String = value.trim().replace(" ", "").lowercase()
-
-    private fun normalizeQuery(value: String): String = value
-        .trim()
-        .lowercase()
-        .replace(' ', '_')
-        .replace('-', '_')
-        .replace(underscoreRegex, "_")
-
-    private fun containsNonAsciiLetter(value: String): Boolean = value.any { it.code > 127 && it.isLetter() }
-
-    private fun popularityScore(postCount: Int): Int = when {
-        postCount >= 1_000_000 -> 300
-        postCount >= 100_000 -> 220
-        postCount >= 10_000 -> 140
-        postCount >= 1_000 -> 80
-        else -> 20
+    // Popularity bonus stays on the same scale as fuzzy scores: it breaks ties
+    // between similar-quality matches without letting a popular tag outrank a
+    // clearly better match on a less popular one.
+    private fun popularityBonus(postCount: Int): Int = when {
+        postCount >= 1_000_000 -> 30
+        postCount >= 100_000 -> 22
+        postCount >= 10_000 -> 15
+        postCount >= 1_000 -> 9
+        postCount >= 100 -> 4
+        else -> 0
     }
 
     private fun correctionThreshold(length: Int): Int = when {
@@ -634,44 +645,15 @@ class TagAutocompleteRepository private constructor(private val context: Context
         else -> 3
     }
 
-    private fun damerauLevenshtein(source: String, target: String, maxDistance: Int): Int {
-        if (source == target) return 0
-        if (abs(source.length - target.length) > maxDistance) return maxDistance + 1
-
-        val rows = source.length + 1
-        val cols = target.length + 1
-        val dp = Array(rows) { IntArray(cols) }
-
-        for (i in 0 until rows) dp[i][0] = i
-        for (j in 0 until cols) dp[0][j] = j
-
-        for (i in 1 until rows) {
-            var rowMin = Int.MAX_VALUE
-            for (j in 1 until cols) {
-                val cost = if (source[i - 1] == target[j - 1]) 0 else 1
-                var value = minOf(
-                    dp[i - 1][j] + 1,
-                    dp[i][j - 1] + 1,
-                    dp[i - 1][j - 1] + cost,
-                )
-                if (i > 1 && j > 1 && source[i - 1] == target[j - 2] && source[i - 2] == target[j - 1]) {
-                    value = minOf(value, dp[i - 2][j - 2] + cost)
-                }
-                dp[i][j] = value
-                if (value < rowMin) rowMin = value
-            }
-            if (rowMin > maxDistance) return maxDistance + 1
-        }
-
-        return dp[source.length][target.length]
-    }
-
-    private data class TagData(
+    // Plain holder (never compared), so the LongArray fields don't drag in
+    // reference-based data-class equals/hashCode.
+    private class TagData(
         val entries: List<TagEntry>,
         val englishByHead: Map<Char, List<TagEntry>>,
         val aliasByHead: Map<Char, List<AliasRef>>,
         val translationEntries: List<TagEntry>,
-        val translationByHead: Map<Char, List<TagEntry>>,
+        val englishBitmaps: LongArray,
+        val translationBitmaps: LongArray,
     )
 
     private data class AliasRef(val entry: TagEntry, val alias: String)
@@ -682,8 +664,13 @@ class TagAutocompleteRepository private constructor(private val context: Context
         private const val MAIN_FILE_NAME = "main.csv"
         private const val TRANSLATION_FILE_NAME = "translation.csv"
         private const val CACHE_FILE_NAME = "dict.bin"
-        private const val CACHE_MAGIC = 0x54444331 // "TDC1"
-        private const val CACHE_VERSION = 1
+        private const val CACHE_MAGIC = 0x54444333 // "TDC3"
+        private const val CACHE_VERSION = 3
+
+        // Edit-distance corrections are a fallback below genuine fuzzy hits but
+        // above sparse, heavily-gapped ones, so an obvious typo fix still surfaces.
+        private const val CORRECTION_BASE = 60
+        private const val CORRECTION_DISTANCE_PENALTY = 25
         private const val KEY_MAIN_NAME = "main_csv_name"
         private const val KEY_MAIN_LINES = "main_csv_lines"
         private const val KEY_TRANSLATION_NAME = "translation_csv_name"
@@ -725,11 +712,11 @@ class TagAutocompleteRepository private constructor(private val context: Context
             val suffix = text.substring(context.segmentEnd)
             val separator = if (suffix.startsWith(",")) "" else ", "
             // Embeddings are matched verbatim by filename stem in PromptProcessor;
-            // converting '_' to ' ' would break the lookup.
+            // converting '_' to ' ' or escaping '()' would break the lookup.
             val core = if (suggestion.matchType == TagMatchType.Embedding) {
                 suggestion.replacementTag
             } else {
-                suggestion.replacementTag.replace('_', ' ')
+                escapePromptParentheses(tagUnderscoresToSpaces(suggestion.replacementTag))
             }
             val replacement = core + separator
             val updated = prefix + replacement + suffix.trimStart()

@@ -588,7 +588,7 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
     val preferences = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
     val useImg2img = preferences.getBoolean("use_img2img", true)
     val enableTagAutocomplete = preferences.getBoolean("enable_tag_autocomplete", true)
-    val tagSuggestionCount = 100
+    val tagSuggestionCount = 128
     val tagAutocompleteRepository = remember { TagAutocompleteRepository.getInstance(context) }
     val tagDictState by tagAutocompleteRepository.state.collectAsState()
     val tagAutocompleteAvailable = enableTagAutocomplete && tagDictState.mainImported

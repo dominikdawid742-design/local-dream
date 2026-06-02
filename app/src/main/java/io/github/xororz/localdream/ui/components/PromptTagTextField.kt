@@ -61,8 +61,10 @@ import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
 import io.github.xororz.localdream.R
+import io.github.xororz.localdream.data.FuzzyMatcher
 import io.github.xororz.localdream.data.TagMatchType
 import io.github.xororz.localdream.data.TagSuggestion
+import io.github.xororz.localdream.data.tagUnderscoresToSpaces
 
 @Composable
 fun PromptTagTextField(
@@ -180,7 +182,7 @@ private fun SuggestionRow(suggestion: TagSuggestion, highlightQuery: String?, on
     val displayPrimary = if (suggestion.matchType == TagMatchType.Embedding) {
         suggestion.primaryText
     } else {
-        suggestion.primaryText.replace('_', ' ')
+        tagUnderscoresToSpaces(suggestion.primaryText)
     }
     Row(
         modifier = Modifier
@@ -207,14 +209,14 @@ private fun SuggestionRow(suggestion: TagSuggestion, highlightQuery: String?, on
             verticalArrangement = Arrangement.spacedBy(2.dp),
         ) {
             Text(
-                text = highlightSubstring(displayPrimary, highlightQuery),
+                text = highlightMatches(displayPrimary, highlightQuery, MaterialTheme.colorScheme.primary),
                 style = MaterialTheme.typography.titleSmall,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
             suggestion.secondaryText?.takeIf { it.isNotBlank() }?.let { secondary ->
                 Text(
-                    text = highlightSubstring(secondary, highlightQuery),
+                    text = highlightMatches(secondary, highlightQuery, MaterialTheme.colorScheme.primary),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
@@ -292,20 +294,35 @@ private fun formatPostCount(n: Int): String = when {
 
 private fun normalizeForHighlight(value: String): String = value.lowercase().replace(' ', '_').replace('-', '_')
 
-private fun highlightSubstring(text: String, query: String?): AnnotatedString {
+private fun highlightMatches(text: String, query: String?, highlightColor: Color): AnnotatedString {
     if (query.isNullOrBlank()) return AnnotatedString(text)
-    val normText = normalizeForHighlight(text)
     val normQuery = normalizeForHighlight(query.trim())
     if (normQuery.isEmpty()) return AnnotatedString(text)
-    val idx = normText.indexOf(normQuery)
-    if (idx < 0) return AnnotatedString(text)
-    val end = (idx + normQuery.length).coerceAtMost(text.length)
+    // normalizeForHighlight only swaps single chars (no trimming or collapsing),
+    // so positions into normText line up one-to-one with text.
+    val normText = normalizeForHighlight(text)
+    val positions = FuzzyMatcher.positions(normQuery.toCharArray(), normText)
+    if (positions == null || positions.isEmpty()) return AnnotatedString(text)
+    val matchStyle = SpanStyle(fontWeight = FontWeight.Bold, color = highlightColor)
     return buildAnnotatedString {
-        append(text.substring(0, idx))
-        withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
-            append(text.substring(idx, end))
+        var idx = 0
+        var p = 0
+        while (idx < text.length) {
+            if (p < positions.size && positions[p] == idx) {
+                val start = idx
+                while (p < positions.size && positions[p] == idx) {
+                    p++
+                    idx++
+                }
+                withStyle(matchStyle) {
+                    append(text.substring(start, idx))
+                }
+            } else {
+                val start = idx
+                while (idx < text.length && (p >= positions.size || positions[p] != idx)) idx++
+                append(text.substring(start, idx))
+            }
         }
-        append(text.substring(end))
     }
 }
 
