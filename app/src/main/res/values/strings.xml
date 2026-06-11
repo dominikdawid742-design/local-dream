@@ -302,6 +302,15 @@
     <string name="select_upscaler_model">Select Upscaler Model</string>
     <string name="upscaling_image">Upscaling image…</string>
     <string name="upscale_failed">Upscale failed: %s</string>
+
+    <!-- UltraFix -->
+    <string name="ultrafix">UltraFix</string>
+    <string name="ultrafix_confirm_hint">UltraFix will refine this image with tiled img2img using the parameters below. A lower denoise strength (0.3-0.5) is recommended. Processing takes a long time; do not use this while the device is hot. To adjust the parameters, edit them on the prompt page first.</string>
+    <string name="ultrafix_params">Image: %1$dx%2$d\nTile: %3$dpx\nSteps: %4$d\nCFG: %5$s\nDenoise strength: %6$s\nScheduler: %7$s\nSeed: %8$s</string>
+    <string name="ultrafix_seed_random">Random</string>
+    <string name="ultrafix_square_required">UltraFix requires a square generation size (e.g. 512x512). Please switch the resolution in Advanced Settings first.</string>
+    <string name="ultrafix_preparing">Preparing UltraFix…</string>
+    <string name="ultrafix_failed">UltraFix failed: %s</string>
     <string name="download_model_first">Please download the model first</string>
     <string name="upscaler_anime">Anime</string>
     <string name="upscaler_anime_desc">Optimized for anime and cartoon images</string>

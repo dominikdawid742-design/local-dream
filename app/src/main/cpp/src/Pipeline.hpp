@@ -81,6 +81,15 @@ struct GenerationRequest {
   // (txt2img / img2img-with-aspect). Used to decide whether to laplacian-blend
   // the decoded image against the original after generation.
   bool user_supplied_mask = false;
+
+  // Ultrafix: tiled img2img over an arbitrarily large (upscaled) input.
+  // VAE encode, every UNet denoising step and the final decode all run as
+  // overlapping fixed-size tiles blended back together, so the QNN graphs
+  // keep their native size while width/height describe the full image.
+  bool ultrafix = false;
+  // UNet tile edge in pixel space = the model's native generation size
+  // (client-provided for sd15npu, forced to 1024 for SDXL).
+  int ultrafix_tile = 512;
 };
 
 // step / total_steps / optional base64 preview image.
@@ -157,6 +166,11 @@ class Pipeline {
   virtual bool initialize() = 0;
   virtual bool supportsImg2Img() const = 0;
   bool isSdxl() const { return sdxl_; }
+  // Ultrafix needs the VAE encoder (img2img) plus fixed-size graphs that can
+  // be run as tiles; the MNN (CPU) format has neither constraint nor need.
+  virtual bool supportsUltrafix() const {
+    return vaeTilingSupported() && supportsImg2Img();
+  }
 
   void setSafetyChecker(MNN::Interpreter *interpreter, MNN::Session *session,
                         float threshold) {
@@ -198,9 +212,11 @@ class Pipeline {
   // in a single graph call so the optimization does not apply there.
   virtual bool canSkipUncond() const = 0;
   virtual bool previewSupported() const = 0;
-  // Tiled VAE encode/decode for >512px outputs (sd15npu only: MNN handles
-  // large resolutions natively and SDXL graphs are fixed at 1024).
+  // Tiled VAE encode/decode for outputs above the fixed graph size (QNN
+  // formats only: MNN handles large resolutions natively).
   virtual bool vaeTilingSupported() const { return false; }
+  // Fixed VAE graph edge in pixel space (512 for SD1.5 NPU, 1024 for SDXL).
+  virtual int vaeTilePixelSize() const { return 512; }
   // Catch-all invoked when generate() exits (normal return or exception);
   // lowram pipelines release any stage model still loaded.
   virtual void releaseTransientModels() {}
@@ -223,6 +239,15 @@ class Pipeline {
   xt::xarray<float> decodeToPixels(const GenerationRequest &req,
                                    const xt::xarray<float> &latents,
                                    bool verbose);
+  xt::xarray<float> runUnetTiled(const GenerationRequest &req,
+                                 const xt::xarray<float> &latents_scaled,
+                                 int timestep, bool skip_uncond,
+                                 Conditioning &cond);
+
+  bool useTiledVae(const GenerationRequest &req) const {
+    return vaeTilingSupported() &&
+           (req.width > vaeTilePixelSize() || req.height > vaeTilePixelSize());
+  }
   std::string renderPreview(const GenerationRequest &req,
                             const xt::xarray<float> &latents);
 
@@ -340,9 +365,8 @@ inline Conditioning Pipeline::encodePrompts(const GenerationRequest &req) {
 inline xt::xarray<float> Pipeline::encodeImageToLatent(
     const GenerationRequest &req, const xt::xarray<float> &original_image) {
   std::vector<int> shape = {1, 4, sample_height, sample_width};
-  bool tiled = vaeTilingSupported() && (req.width > 512 || req.height > 512);
 
-  if (!tiled) {
+  if (!useTiledVae(req)) {
     std::vector<float> vae_enc_mean(1 * 4 * sample_width * sample_height);
     std::vector<float> vae_enc_std(1 * 4 * sample_width * sample_height);
 
@@ -411,16 +435,16 @@ inline xt::xarray<float> Pipeline::encodeImageToLatent(
     return xt::eval(mean + std_dev * noise_0);
   }
 
-  // Tiled path (sd15npu above 512px).
+  // Tiled path (input larger than the fixed VAE graph).
   std::cout << "Using VAE encoder tiling for " << req.width << "x" << req.height
             << " input..." << std::endl;
 
-  const int vae_enc_tile_size = 512;
-  const int vae_enc_latent_tile_size = 64;
+  const int vae_enc_tile_size = vaeTilePixelSize();
+  const int vae_enc_latent_tile_size = vae_enc_tile_size / 8;
 
   auto [img_positions, latent_positions, img_overlap_x, img_overlap_y,
         latent_overlap_x, latent_overlap_y] =
-      calculate_vae_tile_positions(req.width, req.height);
+      calculate_vae_tile_positions(req.width, req.height, vae_enc_tile_size);
 
   std::cout << "VAE encoder will use " << img_positions.size()
             << " tiles with overlap " << img_overlap_x << "x" << img_overlap_y
@@ -476,9 +500,7 @@ inline xt::xarray<float> Pipeline::encodeImageToLatent(
 inline xt::xarray<float> Pipeline::decodeToPixels(
     const GenerationRequest &req, const xt::xarray<float> &latents,
     bool verbose) {
-  bool tiled = vaeTilingSupported() && (req.width > 512 || req.height > 512);
-
-  if (!tiled) {
+  if (!useTiledVae(req)) {
     std::vector<float> vae_dec_in_vec(latents.begin(), latents.end());
     std::vector<float> vae_dec_out_pixels(1 * 3 * req.width * req.height);
     vaeDecode(req, vae_dec_in_vec.data(), vae_dec_out_pixels.data());
@@ -487,12 +509,12 @@ inline xt::xarray<float> Pipeline::decodeToPixels(
     return pixels;
   }
 
-  const int vae_tile_size = 512;
-  const int vae_latent_tile_size = 64;
+  const int vae_tile_size = vaeTilePixelSize();
+  const int vae_latent_tile_size = vae_tile_size / 8;
 
   auto [output_positions, latent_positions, overlap_x, overlap_y,
         latent_overlap_x, latent_overlap_y] =
-      calculate_vae_tile_positions(req.width, req.height);
+      calculate_vae_tile_positions(req.width, req.height, vae_tile_size);
 
   if (verbose) {
     std::cout << "VAE decoder will use " << output_positions.size()
@@ -532,8 +554,8 @@ inline xt::xarray<float> Pipeline::decodeToPixels(
   }
 
   xt::xarray<float> pixels =
-      blend_vae_output_tiles(decoded_tiles, output_positions, req.height,
-                             req.width, vae_tile_size, overlap_x, overlap_y);
+      blend_output_tiles(decoded_tiles, output_positions, req.height, req.width,
+                         vae_tile_size, overlap_x, overlap_y);
 
   if (verbose) {
     std::cout << "VAE tiling completed: " << decoded_tiles.size()
@@ -541,6 +563,66 @@ inline xt::xarray<float> Pipeline::decodeToPixels(
   }
 
   return pixels;
+}
+
+// One full tiled UNet evaluation for ultrafix: runs the fixed-size UNet graph
+// over an overlapping grid of latent tiles, applies CFG per tile, and blends
+// the per-tile noise predictions with the same fade weights as the VAE
+// tiling. Blending the predictions (instead of per-tile denoised latents)
+// keeps a single scheduler step over the full latent, so stateful schedulers
+// (DPM history, ancestral noise) see exactly one image-wide trajectory.
+inline xt::xarray<float> Pipeline::runUnetTiled(
+    const GenerationRequest &req, const xt::xarray<float> &latents_scaled,
+    int timestep, bool skip_uncond, Conditioning &cond) {
+  const int tile_px = req.ultrafix_tile;
+  const int tile_lat = tile_px / 8;
+  const int full_w = sample_width;
+  const int full_h = sample_height;
+  const int min_overlap = tile_lat / 4;
+
+  auto [positions, overlap_x, overlap_y] =
+      calculate_latent_tile_grid(full_w, full_h, tile_lat, min_overlap);
+
+  const int single_size = 4 * tile_lat * tile_lat;
+  std::vector<float> tile_in(2 * single_size);
+  std::vector<float> tile_out(2 * single_size);
+  std::vector<int> tile_shape = {1, 4, tile_lat, tile_lat};
+
+  std::vector<xt::xarray<float>> pred_tiles;
+  pred_tiles.reserve(positions.size());
+
+  // The UNet graph IO is sized from the Config.hpp globals; run it at tile
+  // size while this scope is active.
+  ScopedSizeOverride tile_io(tile_px, tile_px, tile_lat, tile_lat);
+
+  for (auto [x, y] : positions) {
+    xt::xarray<float> lat_tile =
+        xt::view(latents_scaled, 0, xt::all(), xt::range(y, y + tile_lat),
+                 xt::range(x, x + tile_lat));
+    std::copy(lat_tile.begin(), lat_tile.end(), tile_in.begin());
+    std::copy(lat_tile.begin(), lat_tile.end(), tile_in.begin() + single_size);
+
+    runUnetStep(req, tile_in.data(), timestep, skip_uncond, cond,
+                tile_out.data());
+
+    xt::xarray<float> pred;
+    if (skip_uncond) {
+      std::vector<float> cond_only(tile_out.begin() + single_size,
+                                   tile_out.end());
+      pred = xt::adapt(cond_only, tile_shape);
+    } else {
+      std::vector<int> batch2_shape = {2, 4, tile_lat, tile_lat};
+      xt::xarray<float> pred_batch = xt::adapt(tile_out, batch2_shape);
+      xt::xarray<float> uncond = xt::view(pred_batch, 0);
+      xt::xarray<float> txt = xt::view(pred_batch, 1);
+      pred = xt::eval(uncond + req.cfg * (txt - uncond));
+      pred.reshape({1, 4, tile_lat, tile_lat});
+    }
+    pred_tiles.push_back(std::move(pred));
+  }
+
+  return blend_output_tiles(pred_tiles, positions, full_h, full_w, tile_lat,
+                            overlap_x, overlap_y);
 }
 
 // Decodes the current latents to a base64 RGB preview, cropped the same way
@@ -584,6 +666,8 @@ inline GenerationResult Pipeline::generate(
     throw std::runtime_error("SafetyChecker missing");
   if (req.img2img && !supportsImg2Img())
     throw std::runtime_error("img2img not available (VAE encoder not loaded)");
+  if (req.ultrafix && !supportsUltrafix())
+    throw std::runtime_error("ultrafix not available on this backend");
   if (req.img2img && req.img_data.size() != (size_t)3 * req.width * req.height)
     throw std::invalid_argument("Invalid img_data");
   if (req.has_mask &&
@@ -695,6 +779,17 @@ inline GenerationResult Pipeline::generate(
     // --- UNET Denoising Loop ---
     int single_latent_size = 1 * 4 * sample_width * sample_height;
 
+    // Ultrafix: the latent is larger than the fixed UNet graph, so every
+    // step runs the graph over an overlapping tile grid.
+    const int unet_tile_lat = req.ultrafix_tile / 8;
+    const bool unet_tiled = req.ultrafix && (sample_width > unet_tile_lat ||
+                                             sample_height > unet_tile_lat);
+    if (unet_tiled) {
+      std::cout << "Ultrafix: tiled UNet at " << req.ultrafix_tile
+                << "px tiles over " << req.width << "x" << req.height
+                << std::endl;
+    }
+
     beginDenoise(req);
 
     for (int i = start_step; i < (int)timesteps.size(); ++i) {
@@ -713,37 +808,44 @@ inline GenerationResult Pipeline::generate(
       xt::xarray<float> latents_scaled =
           scheduler->scale_model_input(latents, current_ts);
 
-      std::vector<float> latents_in_vec;
-      latents_in_vec.reserve(batch_size * single_latent_size);
-      latents_in_vec.insert(latents_in_vec.end(), latents_scaled.begin(),
-                            latents_scaled.end());
-      latents_in_vec.insert(latents_in_vec.end(), latents_scaled.begin(),
-                            latents_scaled.end());
-      std::vector<float> unet_out_latents(batch_size * single_latent_size);
-
       const bool skip_uncond = canSkipUncond() && (req.cfg == 1.0f);
 
-      runUnetStep(req, latents_in_vec.data(), static_cast<int>(current_ts),
-                  skip_uncond, cond, unet_out_latents.data());
+      xt::xarray<float> noise_pred;
+      if (unet_tiled) {
+        noise_pred =
+            runUnetTiled(req, latents_scaled, static_cast<int>(current_ts),
+                         skip_uncond, cond);
+      } else {
+        std::vector<float> latents_in_vec;
+        latents_in_vec.reserve(batch_size * single_latent_size);
+        latents_in_vec.insert(latents_in_vec.end(), latents_scaled.begin(),
+                              latents_scaled.end());
+        latents_in_vec.insert(latents_in_vec.end(), latents_scaled.begin(),
+                              latents_scaled.end());
+        std::vector<float> unet_out_latents(batch_size * single_latent_size);
+
+        runUnetStep(req, latents_in_vec.data(), static_cast<int>(current_ts),
+                    skip_uncond, cond, unet_out_latents.data());
+
+        if (skip_uncond) {
+          // cfg = 1 path: only the cond half of unet_out_latents was filled.
+          std::vector<float> cond_only(
+              unet_out_latents.begin() + single_latent_size,
+              unet_out_latents.end());
+          noise_pred = xt::adapt(cond_only, shape);
+        } else {
+          xt::xarray<float> noise_pred_batch =
+              xt::adapt(unet_out_latents, shape_batch2);
+          xt::xarray<float> uncond = xt::view(noise_pred_batch, 0);
+          xt::xarray<float> txt = xt::view(noise_pred_batch, 1);
+          noise_pred = xt::eval(uncond + req.cfg * (txt - uncond));
+        }
+      }
 
       auto step_dur = elapsedMs(step_start_time);
       if (i == start_step) first_step_time_ms = (int)step_dur;
       std::cout << "UNET step " << i << " dur: " << step_dur << "ms\n";
 
-      xt::xarray<float> noise_pred;
-      if (skip_uncond) {
-        // cfg = 1 path: only the cond half of unet_out_latents was filled.
-        std::vector<float> cond_only(
-            unet_out_latents.begin() + single_latent_size,
-            unet_out_latents.end());
-        noise_pred = xt::adapt(cond_only, shape);
-      } else {
-        xt::xarray<float> noise_pred_batch =
-            xt::adapt(unet_out_latents, shape_batch2);
-        xt::xarray<float> uncond = xt::view(noise_pred_batch, 0);
-        xt::xarray<float> txt = xt::view(noise_pred_batch, 1);
-        noise_pred = xt::eval(uncond + req.cfg * (txt - uncond));
-      }
       latents = scheduler->step(noise_pred, timesteps(i), latents).prev_sample;
 
       if (req.has_mask) {
@@ -761,7 +863,7 @@ inline GenerationResult Pipeline::generate(
     // --- VAE Decode ---
     auto vae_dec_start = std::chrono::high_resolution_clock::now();
 
-    if (vaeTilingSupported() && (req.width > 512 || req.height > 512)) {
+    if (useTiledVae(req)) {
       std::cout << "Using VAE decoder tiling for " << req.width << "x"
                 << req.height << " output..." << std::endl;
     }

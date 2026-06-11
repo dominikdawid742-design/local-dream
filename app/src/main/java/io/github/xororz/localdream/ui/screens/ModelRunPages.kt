@@ -31,11 +31,13 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
@@ -67,6 +69,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -95,8 +98,11 @@ internal fun ModelRunResultPage(
     showReportButton: Boolean,
     showUpscaleButton: Boolean,
     upscaleEnabled: Boolean,
+    showUltrafixButton: Boolean,
+    ultrafixEnabled: Boolean,
     onReportClick: () -> Unit,
     onUpscaleClick: () -> Unit,
+    onUltrafixClick: () -> Unit,
     onSaveClick: (Bitmap) -> Unit,
     onPreviewClick: () -> Unit,
     onShowParameters: () -> Unit,
@@ -211,6 +217,18 @@ internal fun ModelRunResultPage(
                                         }
                                     }
 
+                                    if (showUltrafixButton) {
+                                        FilledTonalIconButton(
+                                            onClick = onUltrafixClick,
+                                            enabled = ultrafixEnabled,
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.AutoAwesome,
+                                                contentDescription = "ultrafix image",
+                                            )
+                                        }
+                                    }
+
                                     FilledTonalIconButton(
                                         onClick = { onSaveClick(bitmap) },
                                     ) {
@@ -263,7 +281,27 @@ internal fun ModelRunResultPage(
                         }
 
                         if (historyItems.size > 1) {
+                            val thumbListState = rememberLazyListState()
+                            val newestId = historyItems.firstOrNull()?.id
+                            LaunchedEffect(newestId) {
+                                // New items are inserted at the head and the keyed
+                                // lazy list anchors to the currently visible thumb,
+                                // which is right mid-scroll but leaves a new thumb
+                                // hidden off-screen when the row is parked at the
+                                // far left. Index <= 1 covers reading the position
+                                // both before (0) and after (1) the anchoring
+                                // measure pass; the frame wait orders the snap
+                                // after that pass.
+                                if (newestId != null &&
+                                    thumbListState.firstVisibleItemIndex <= 1 &&
+                                    thumbListState.firstVisibleItemScrollOffset == 0
+                                ) {
+                                    withFrameNanos {}
+                                    thumbListState.scrollToItem(0)
+                                }
+                            }
                             LazyRow(
+                                state = thumbListState,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(top = 8.dp),

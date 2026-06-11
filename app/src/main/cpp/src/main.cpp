@@ -344,13 +344,15 @@ static void registerGenerateEndpoint(httplib::Server &svr, Pipeline *pipeline) {
     try {
       auto json = nlohmann::json::parse(request.body);
       auto req = std::make_shared<GenerationRequest>(parseGenerationRequest(
-          json, pipeline->isSdxl(), pipeline->supportsImg2Img()));
+          json, pipeline->isSdxl(), pipeline->supportsImg2Img(),
+          pipeline->supportsUltrafix()));
 
       std::cout << "Req Rcvd: P:" << req->prompt
                 << " NP:" << req->negative_prompt << " S:" << req->steps
                 << " CFG:" << req->cfg << " Seed:" << req->seed
                 << " Size:" << req->width << "x" << req->height
                 << " Img2Img:" << req->img2img << " Mask:" << req->has_mask
+                << " Ultrafix:" << req->ultrafix
                 << " Denoise:" << req->denoise_strength
                 << " ShowProcess:" << req->show_diffusion_process
                 << " Stride:" << req->show_diffusion_stride << std::endl;

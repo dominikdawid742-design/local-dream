@@ -215,6 +215,7 @@ import io.github.xororz.localdream.utils.performUpscale
 import io.github.xororz.localdream.utils.reportImage
 import io.github.xororz.localdream.utils.saveImage
 import io.github.xororz.localdream.utils.saveImageFromFile
+import io.github.xororz.localdream.utils.schedulerDisplayName
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.Base64
@@ -261,6 +262,7 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
     val msgShareCopied = stringResource(R.string.share_copied)
     val msgImportApplied = stringResource(R.string.import_applied)
     val msgUpscaleFailed = stringResource(R.string.upscale_failed)
+    val msgUltrafixFailed = stringResource(R.string.ultrafix_failed)
     val msgSavedCountWithFailed = stringResource(R.string.saved_count_with_failed)
     val msgDeletedCountWithFailed = stringResource(R.string.deleted_count_with_failed)
     // Reaches the screen with the repository already loaded on the normal
@@ -507,6 +509,14 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
     // Upscaler related states
     var showUpscalerDialog by remember { mutableStateOf(false) }
     var isUpscaling by remember { mutableStateOf(false) }
+
+    // Ultrafix (tiled img2img repair of an upscaled image) states.
+    // pendingUltrafix marks the in-flight generation as an ultrafix run so the
+    // completion handler can record the right mode.
+    var showUltrafixConfirmDialog by remember { mutableStateOf(false) }
+    var showUltrafixSquareDialog by remember { mutableStateOf(false) }
+    var pendingUltrafix by remember { mutableStateOf(false) }
+    var isUltrafixPreparing by remember { mutableStateOf(false) }
     val upscalerRepository = remember { UpscalerRepository.getInstance(context) }
     val upscalerPreferences =
         remember { context.getSharedPreferences("upscaler_prefs", Context.MODE_PRIVATE) }
@@ -829,6 +839,86 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
         }
     }
 
+    // Runs tiled img2img ("ultrafix") over the currently displayed (upscaled)
+    // bitmap at its full resolution, using the prompt-page parameters. The
+    // base image goes through its own file so a pending img2img selection in
+    // tmp.txt is left untouched.
+    fun startUltrafix() {
+        val bmp = currentBitmap ?: return
+        val tileSize = maxOf(currentWidth, currentHeight)
+        isUltrafixPreparing = true
+        generationParamsTmp = GenerationParameters(
+            steps = steps.roundToInt(),
+            cfg = cfg,
+            seed = 0,
+            prompt = promptField.text,
+            negativePrompt = negativePromptField.text,
+            generationTime = "",
+            width = bmp.width,
+            height = bmp.height,
+            runOnCpu = false,
+            denoiseStrength = denoiseStrength,
+            useOpenCL = false,
+            scheduler = scheduler,
+        )
+        batchGenerationJob = coroutineScope.launch {
+            // The progress card lives on the prompt page; bring it into view.
+            try {
+                pagerState.animateScrollToPage(0)
+            } catch (_: kotlinx.coroutines.CancellationException) {
+                // Scroll interrupted by another gesture; the run still starts.
+            }
+            val started = try {
+                withContext(Dispatchers.IO) {
+                    File(context.filesDir, "ultrafix.txt").writeText(bitmapToBase64Png(bmp))
+                }
+                pendingUltrafix = true
+                val intent = Intent(context, BackgroundGenerationService::class.java).apply {
+                    putExtra("prompt", promptField.text)
+                    putExtra("negative_prompt", negativePromptField.text)
+                    putExtra("steps", steps.roundToInt())
+                    putExtra("cfg", cfg)
+                    seed.toLongOrNull()?.let { putExtra("seed", it) }
+                    putExtra("width", bmp.width)
+                    putExtra("height", bmp.height)
+                    putExtra("effective_width", bmp.width)
+                    putExtra("effective_height", bmp.height)
+                    putExtra("denoise_strength", denoiseStrength)
+                    putExtra("scheduler", scheduler)
+                    putExtra("ultrafix", true)
+                    putExtra("ultrafix_tile_size", tileSize)
+                }
+                context.startForegroundService(intent)
+                true
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                pendingUltrafix = false
+                Toast.makeText(
+                    context,
+                    msgUltrafixFailed.format(e.message ?: "Unknown error"),
+                    Toast.LENGTH_SHORT,
+                ).show()
+                false
+            } finally {
+                isUltrafixPreparing = false
+            }
+            if (!started) return@launch
+
+            // Same teardown as the batch loop: wait for the terminal state and
+            // the service stop, then clear the running flag so the prompt-page
+            // progress card doesn't linger at 0%.
+            BackgroundGenerationService.generationState.first { state ->
+                state is GenerationState.Complete || state is GenerationState.Error
+            }
+            withTimeoutOrNull(5000L) {
+                BackgroundGenerationService.isServiceRunning.first { !it }
+            }
+            BackgroundGenerationService.resetState()
+            isRunning = false
+        }
+    }
+
     val photoPickerLauncher = rememberLauncherForActivityResult(
         PickVisualMedia(),
     ) { uri ->
@@ -988,6 +1078,7 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
         BackgroundGenerationService.stop(context)
         BackgroundGenerationService.resetState()
         intermediateBitmap = null
+        pendingUltrafix = false
         isRunning = false
         progress = 0f
         currentBatchIndex = 0
@@ -1136,7 +1227,10 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                         }
                     }
 
+                    val wasUltrafix = pendingUltrafix
+                    pendingUltrafix = false
                     val currentGenerationMode = when {
+                        wasUltrafix -> GenerationMode.ULTRAFIX
                         isInpaintMode -> GenerationMode.INPAINT
                         selectedImageUri != null -> GenerationMode.IMG2IMG
                         else -> GenerationMode.TXT2IMG
@@ -1171,7 +1265,11 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                         )
                         if (savedItem != null) {
                             withContext(Dispatchers.Main) {
-                                stitchableHistoryIds = setOf(savedItem.id)
+                                // An ultrafix result is a standalone image, not a
+                                // stitchable inpaint patch.
+                                if (!wasUltrafix) {
+                                    stitchableHistoryIds = setOf(savedItem.id)
+                                }
                                 currentDisplayedHistoryId = savedItem.id
                             }
                         }
@@ -1182,11 +1280,13 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                     generationParamsModelId = modelId
                     imageVersion += 1
 
-                    snapshotIsInpaintMode = isInpaintMode
-                    snapshotSelectedImageUri = selectedImageUri
-                    snapshotCropRect = cropRect
-                    snapshotMaskBitmap = if (isInpaintMode) maskBitmap else null
-                    snapshotHasOriginalImage = hasOriginalImageForStitch
+                    if (!wasUltrafix) {
+                        snapshotIsInpaintMode = isInpaintMode
+                        snapshotSelectedImageUri = selectedImageUri
+                        snapshotCropRect = cropRect
+                        snapshotMaskBitmap = if (isInpaintMode) maskBitmap else null
+                        snapshotHasOriginalImage = hasOriginalImageForStitch
+                    }
                     // stitchableHistoryIds / currentDisplayedHistoryId are set once
                     // the DB save above resolves.
                     stitchableHistoryIds = emptySet()
@@ -1217,6 +1317,7 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                 isRunning = false
                 progress = 0f
                 generationStartTime = null
+                pendingUltrafix = false
             }
 
             else -> {
@@ -1623,6 +1724,7 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                         Button(
                             onClick = {
                                 focusManager.clearFocus()
+                                pendingUltrafix = false
                                 Log.d(
                                     "ModelRunScreen",
                                     "start generation",
@@ -2165,8 +2267,25 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                             showUpscaleButton = !model.runOnCpu &&
                                 generationParams?.let { maxOf(it.width, it.height) <= 1024 } == true,
                             upscaleEnabled = !isRunning && !isUpscaling,
+                            // Ultrafix takes over where upscaling stops: NPU-only,
+                            // image larger than the upscale ceiling, and every
+                            // UNet/VAE tile must fit inside the shorter edge.
+                            showUltrafixButton = !model.runOnCpu &&
+                                generationParams?.let {
+                                    maxOf(it.width, it.height) > 1024 &&
+                                        minOf(it.width, it.height) >=
+                                        maxOf(currentWidth, currentHeight, 512)
+                                } == true,
+                            ultrafixEnabled = !isRunning && !isUpscaling && !isUltrafixPreparing,
                             onReportClick = { showReportDialog = true },
                             onUpscaleClick = { showUpscalerDialog = true },
+                            onUltrafixClick = {
+                                if (model.isSdxl || currentWidth == currentHeight) {
+                                    showUltrafixConfirmDialog = true
+                                } else {
+                                    showUltrafixSquareDialog = true
+                                }
+                            },
                             onSaveClick = { bitmap ->
                                 handleSaveImage(
                                     context = context,
@@ -2385,6 +2504,90 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
         )
     }
 
+    // Ultrafix: SD1.5 with a non-square generation size cannot tile (the UNet
+    // graph is square); ask the user to switch resolution first.
+    if (showUltrafixSquareDialog) {
+        AlertDialog(
+            onDismissRequest = { showUltrafixSquareDialog = false },
+            title = { Text(stringResource(R.string.ultrafix)) },
+            text = { Text(stringResource(R.string.ultrafix_square_required)) },
+            confirmButton = {
+                TextButton(onClick = { showUltrafixSquareDialog = false }) {
+                    Text(stringResource(R.string.confirm))
+                }
+            },
+        )
+    }
+
+    // Ultrafix parameter confirmation.
+    if (showUltrafixConfirmDialog) {
+        val randomSeedLabel = stringResource(R.string.ultrafix_seed_random)
+        AlertDialog(
+            onDismissRequest = { showUltrafixConfirmDialog = false },
+            title = { Text(stringResource(R.string.ultrafix)) },
+            text = {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(stringResource(R.string.ultrafix_confirm_hint))
+                    Text(
+                        stringResource(
+                            R.string.ultrafix_params,
+                            currentBitmap?.width ?: 0,
+                            currentBitmap?.height ?: 0,
+                            maxOf(currentWidth, currentHeight),
+                            steps.roundToInt(),
+                            String.format(Locale.US, "%.1f", cfg),
+                            String.format(Locale.US, "%.2f", denoiseStrength),
+                            schedulerDisplayName(scheduler),
+                            seed.ifBlank { randomSeedLabel },
+                        ),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    // The prompts are only a reminder of what will run; show a
+                    // truncated preview instead of the full text.
+                    fun preview(text: String) = if (text.length > 80) text.take(80) + "..." else text
+                    if (promptField.text.isNotBlank()) {
+                        Text(
+                            stringResource(R.string.image_prompt),
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Text(
+                            preview(promptField.text),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (negativePromptField.text.isNotBlank()) {
+                        Text(
+                            stringResource(R.string.negative_prompt),
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Text(
+                            preview(negativePromptField.text),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showUltrafixConfirmDialog = false
+                    startUltrafix()
+                }) {
+                    Text(stringResource(R.string.confirm))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showUltrafixConfirmDialog = false }) {
+                    Text(stringResource(R.string.cancel))
+                }
+            },
+        )
+    }
+
     // Upscaler dialog
     if (showUpscalerDialog) {
         UpscalerPickerFlow(
@@ -2478,6 +2681,15 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
         ContainedLoadingIndicator()
         Text(
             text = stringResource(R.string.upscaling_image),
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+    }
+
+    BlockingProgressOverlay(visible = isUltrafixPreparing) {
+        ContainedLoadingIndicator()
+        Text(
+            text = stringResource(R.string.ultrafix_preparing),
             style = MaterialTheme.typography.bodyLarge,
             color = MaterialTheme.colorScheme.onSurface,
         )

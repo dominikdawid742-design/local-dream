@@ -1,11 +1,10 @@
 #ifndef PIPELINESDXL_HPP
 #define PIPELINESDXL_HPP
 
+#include <MNN/Interpreter.hpp>
 #include <memory>
 #include <stdexcept>
 #include <string>
-
-#include <MNN/Interpreter.hpp>
 
 #include "Config.hpp"
 #include "MnnUtils.hpp"
@@ -64,8 +63,7 @@ class PipelineSdxl : public PipelineQnn {
       QNN_INFO("img2img disabled: VAE encoder not loaded");
     }
 
-    if (qnn_runtime::initializeApp("UNET", unet_) != EXIT_SUCCESS)
-      return false;
+    if (qnn_runtime::initializeApp("UNET", unet_) != EXIT_SUCCESS) return false;
     if (qnn_runtime::initializeApp("VAEDecoder", vae_decoder_) != EXIT_SUCCESS)
       return false;
     if (vae_encoder_ &&
@@ -78,10 +76,20 @@ class PipelineSdxl : public PipelineQnn {
     return lowram_ ? !vae_encoder_path_.empty() : vae_encoder_ != nullptr;
   }
 
+  // Lowram loads/releases the VAE per vaeEncode/vaeDecode call, which the
+  // ultrafix tile loops would turn into one full model reload per tile.
+  bool supportsUltrafix() const override {
+    return !lowram_ && Pipeline::supportsUltrafix();
+  }
+
  protected:
   // Per-stage decode previews would force a VAE decoder load/release per
   // step in lowram mode; disable them there.
   bool previewSupported() const override { return !lowram_; }
+  // Normal SDXL generation is exactly 1024 so tiling never triggers there;
+  // only ultrafix inputs exceed the fixed graph size.
+  bool vaeTilingSupported() const override { return true; }
+  int vaeTilePixelSize() const override { return 1024; }
 
   void encodeText(const ProcessedPromptPair &prompts, bool need_negative,
                   bool need_positive, Conditioning &cond) override {
@@ -95,8 +103,7 @@ class PipelineSdxl : public PipelineQnn {
     }
     if (need_positive) {
       runDualClip(prompts.positive_embeddings, prompts.positive_embeddings_2,
-                  prompts.ids.data() + 77, cond.posHidden(),
-                  cond.posPooled());
+                  prompts.ids.data() + 77, cond.posHidden(), cond.posPooled());
     }
 
     if (lowram_) releaseClips();
@@ -106,9 +113,8 @@ class PipelineSdxl : public PipelineQnn {
                  float *std_dev) override {
     if (lowram_) loadVaeEncoderIfNeeded();
     if (!vae_encoder_) throw std::runtime_error("QNN VAE Enc missing");
-    if (StatusCode::SUCCESS !=
-        vae_encoder_->executeVaeEncoderGraphsSDXL(const_cast<float *>(image),
-                                                  mean, std_dev))
+    if (StatusCode::SUCCESS != vae_encoder_->executeVaeEncoderGraphsSDXL(
+                                   const_cast<float *>(image), mean, std_dev))
       throw std::runtime_error("QNN VAE enc SDXL exec failed");
     if (lowram_) releaseVaeEncoder();
   }
@@ -129,17 +135,15 @@ class PipelineSdxl : public PipelineQnn {
     float *time_ids = cond.time_ids.data();
 
     if (!skip_uncond &&
-        StatusCode::SUCCESS !=
-            unet_->executeUnetGraphsSDXL(latents_in, timestep,
-                                         cond.negHidden(), cond.negPooled(),
-                                         time_ids, out_batch2))
+        StatusCode::SUCCESS != unet_->executeUnetGraphsSDXL(
+                                   latents_in, timestep, cond.negHidden(),
+                                   cond.negPooled(), time_ids, out_batch2))
       throw std::runtime_error("QNN UNET SDXL exec failed (uncond)");
 
     if (StatusCode::SUCCESS !=
-        unet_->executeUnetGraphsSDXL(latents_in + single_latent_size, timestep,
-                                     cond.posHidden(), cond.posPooled(),
-                                     time_ids + 6,
-                                     out_batch2 + single_latent_size))
+        unet_->executeUnetGraphsSDXL(
+            latents_in + single_latent_size, timestep, cond.posHidden(),
+            cond.posPooled(), time_ids + 6, out_batch2 + single_latent_size))
       throw std::runtime_error("QNN UNET SDXL exec failed (cond)");
   }
 

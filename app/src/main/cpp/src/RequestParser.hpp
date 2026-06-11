@@ -17,11 +17,13 @@
 #include "json.hpp"
 
 // Builds a GenerationRequest from the /generate JSON body: scalar params,
-// base64 image/mask decoding, and the SDXL aspect-ratio padding setup
-// (synthetic canvas, paint-rectangle mask synthesis / intersection).
+// base64 image/mask decoding, the SDXL aspect-ratio padding setup
+// (synthetic canvas, paint-rectangle mask synthesis / intersection), and the
+// ultrafix (tiled img2img) validation.
 inline GenerationRequest parseGenerationRequest(const nlohmann::json &json,
                                                 bool sdxl,
-                                                bool img2img_available) {
+                                                bool img2img_available,
+                                                bool ultrafix_supported) {
   GenerationRequest req;
 
   if (!json.contains("prompt")) throw std::invalid_argument("Missing 'prompt'");
@@ -43,7 +45,37 @@ inline GenerationRequest parseGenerationRequest(const nlohmann::json &json,
     req.width = size;
     req.height = size;
   }
-  if (sdxl) {
+
+  // --- Ultrafix: tiled img2img over a large upscaled image ----------------
+  // width/height stay at the full image size; the UNet/VAE graphs run at the
+  // fixed tile size and the loop blends overlapping tiles, so the only hard
+  // requirements are 8-alignment and that every fixed-size tile fits.
+  req.ultrafix = json.value("ultrafix", false);
+  if (req.ultrafix) {
+    if (!ultrafix_supported)
+      throw std::invalid_argument("ultrafix not supported by this backend");
+    if (!json.contains("image"))
+      throw std::invalid_argument("ultrafix requires 'image'");
+    if (json.contains("mask"))
+      throw std::invalid_argument("ultrafix does not support 'mask'");
+    req.ultrafix_tile = sdxl ? 1024 : json.value("tile_size", 512);
+    if (req.ultrafix_tile <= 0 || req.ultrafix_tile % 8 != 0)
+      throw std::invalid_argument("Invalid ultrafix tile_size");
+    if (req.width % 8 != 0 || req.height % 8 != 0)
+      throw std::invalid_argument("ultrafix size must be a multiple of 8");
+    // Both the UNet tile and the 512px (SD1.5) / 1024px (SDXL) VAE tile must
+    // fit inside the image.
+    int min_dim = std::max(req.ultrafix_tile, sdxl ? 1024 : 512);
+    if (std::min(req.width, req.height) < min_dim)
+      throw std::invalid_argument("ultrafix image shorter edge must be >= " +
+                                  std::to_string(min_dim));
+    if (std::max(req.width, req.height) > 8192)
+      throw std::invalid_argument("ultrafix image too large (max 8192)");
+    // A per-step preview would tile-decode the whole image every step.
+    req.show_diffusion_process = false;
+  }
+
+  if (sdxl && !req.ultrafix) {
     req.width = 1024;
     req.height = 1024;
   }
@@ -65,7 +97,8 @@ inline GenerationRequest parseGenerationRequest(const nlohmann::json &json,
   // encoder so the synthetic black canvas can be encoded as the inpaint
   // base latent; if the SDXL build was started without one, fall through
   // to plain 1024x1024 generation.
-  if (sdxl && json.contains("aspect_ratio") && img2img_available) {
+  if (sdxl && json.contains("aspect_ratio") && img2img_available &&
+      !req.ultrafix) {
     std::string ar = json["aspect_ratio"].get<std::string>();
     auto colon = ar.find(':');
     if (colon != std::string::npos) {

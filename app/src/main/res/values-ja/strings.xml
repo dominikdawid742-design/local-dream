@@ -264,6 +264,13 @@
     <string name="select_upscaler_model">アップスケーラーモデルを選択</string>
     <string name="upscaling_image">画像のアップスケール中…</string>
     <string name="upscale_failed">アップスケールに失敗しました: %s</string>
+    <string name="ultrafix">UltraFix</string>
+    <string name="ultrafix_confirm_hint">UltraFixは以下のパラメータでタイル分割img2imgを実行し、画像全体を補正します。低めのノイズ除去強度(0.3-0.5)を推奨します。処理には時間がかかるため、デバイスが高温の時は使用しないでください。パラメータを変更する場合は先にプロンプトページで編集してください。</string>
+    <string name="ultrafix_params">画像: %1$dx%2$d\nタイル: %3$dpx\nステップ: %4$d\nCFG: %5$s\nノイズ除去強度: %6$s\nスケジューラ: %7$s\nシード: %8$s</string>
+    <string name="ultrafix_seed_random">ランダム</string>
+    <string name="ultrafix_square_required">UltraFixには正方形の生成サイズ(例: 512x512)が必要です。先に詳細設定で解像度を切り替えてください。</string>
+    <string name="ultrafix_preparing">UltraFixを準備中…</string>
+    <string name="ultrafix_failed">UltraFixに失敗しました: %s</string>
     <string name="download_model_first">まずモデルをダウンロードしてください</string>
     <string name="upscaler_anime">アニメ風</string>
     <string name="upscaler_anime_desc">アニメや漫画の画像に最適化</string>

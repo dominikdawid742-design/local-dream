@@ -151,8 +151,24 @@ class BackgroundGenerationService : Service() {
         val useOpenCL = intent.getBooleanExtra("use_opencl", false)
         val scheduler = intent.getStringExtra("scheduler") ?: "dpm"
         val aspectRatio = intent.getStringExtra("aspect_ratio") ?: "1:1"
+        // Ultrafix: tiled img2img repair over an upscaled image. Uses its own
+        // base-image file so a pending img2img selection in tmp.txt survives.
+        val ultrafix = intent.getBooleanExtra("ultrafix", false)
+        val ultrafixTileSize = intent.getIntExtra("ultrafix_tile_size", 512)
 
-        val image = if (intent.getBooleanExtra("has_image", false)) {
+        val image = if (ultrafix) {
+            try {
+                val ultrafixFile = File(applicationContext.filesDir, "ultrafix.txt")
+                if (ultrafixFile.exists()) {
+                    ultrafixFile.readText()
+                } else {
+                    null
+                }
+            } catch (e: Exception) {
+                Log.e("GenerationService", "Failed to read ultrafix image data", e)
+                null
+            }
+        } else if (intent.getBooleanExtra("has_image", false)) {
             try {
                 val tmpFile = File(applicationContext.filesDir, "tmp.txt")
                 if (tmpFile.exists()) {
@@ -213,12 +229,15 @@ class BackgroundGenerationService : Service() {
                 useOpenCL,
                 scheduler,
                 aspectRatio,
+                ultrafix,
+                ultrafixTileSize,
             )
         }
 
         return START_NOT_STICKY
     }
 
+    @Suppress("LongParameterList")
     private suspend fun runGeneration(
         prompt: String,
         negativePrompt: String,
@@ -235,6 +254,8 @@ class BackgroundGenerationService : Service() {
         useOpenCL: Boolean,
         scheduler: String,
         aspectRatio: String,
+        ultrafix: Boolean,
+        ultrafixTileSize: Int,
     ) = withContext(Dispatchers.IO) {
         // Set once the complete event is fully handled; a socket teardown
         // racing the service shutdown after that point is not an error.
@@ -262,7 +283,16 @@ class BackgroundGenerationService : Service() {
                 put("scheduler", scheduler)
                 put("show_diffusion_process", showProcess)
                 put("show_diffusion_stride", showStride)
-                put("aspect_ratio", aspectRatio)
+                if (ultrafix) {
+                    put("ultrafix", true)
+                    put("tile_size", ultrafixTileSize)
+                    // The result is 4x-class resolution; raw RGB would be a
+                    // ~67 MB base64 payload at 4096x4096. It is persisted as
+                    // JPEG by the history manager anyway.
+                    put("output_format", "jpeg")
+                } else {
+                    put("aspect_ratio", aspectRatio)
+                }
                 seed?.let { put("seed", it) }
                 image?.let { put("image", it) }
                 mask?.let { put("mask", it) }

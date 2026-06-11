@@ -79,7 +79,9 @@ class HistoryManager(private val context: Context) {
             val timestamp = System.currentTimeMillis()
             val historyDir = getHistoryDir(modelId)
 
-            val isUpscaled = upscalerId != null
+            // Upscaled and ultrafixed images are 4x-class resolutions; store
+            // them as JPEG (PNG would be tens of MB and seconds to encode).
+            val isUpscaled = upscalerId != null || mode == GenerationMode.ULTRAFIX
             val ext = if (isUpscaled) "jpg" else "png"
             val imageFile = File(historyDir, "$timestamp.$ext")
             FileOutputStream(imageFile).use { out ->
@@ -98,7 +100,10 @@ class HistoryManager(private val context: Context) {
                 width = params.width,
                 height = params.height,
                 mode = mode.name,
-                denoiseStrength = if (mode == GenerationMode.IMG2IMG || mode == GenerationMode.INPAINT) {
+                denoiseStrength = if (mode == GenerationMode.IMG2IMG ||
+                    mode == GenerationMode.INPAINT ||
+                    mode == GenerationMode.ULTRAFIX
+                ) {
                     params.denoiseStrength
                 } else {
                     null

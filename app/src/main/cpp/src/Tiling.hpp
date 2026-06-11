@@ -5,7 +5,6 @@
 #include <tuple>
 #include <utility>
 #include <vector>
-
 #include <xtensor/xarray.hpp>
 #include <xtensor/xbuilder.hpp>
 #include <xtensor/xeval.hpp>
@@ -88,15 +87,17 @@ inline std::vector<int> calculate_tile_positions(int dimension, int tile_size,
 }
 
 // Calculate tile positions and overlaps for VAE encoder/decoder.
+// `vae_tile_size` is the fixed graph size in pixel space (512 for SD1.5 NPU,
+// 1024 for SDXL); the minimum overlap is a quarter tile in latent space.
 // Returns: {pixel_positions, latent_positions, pixel_overlap_x,
 // pixel_overlap_y, latent_overlap_x, latent_overlap_y}
 inline std::tuple<std::vector<std::pair<int, int>>,
                   std::vector<std::pair<int, int>>, int, int, int, int>
-calculate_vae_tile_positions(int pixel_width, int pixel_height) {
-  const int vae_tile_size = 512;        // Fixed VAE tile size in pixel space
-  const int vae_latent_tile_size = 64;  // Fixed VAE tile size in latent space
-  const int min_latent_overlap = 16;    // Minimum overlap in latent space
-  const int scale_factor = 8;           // VAE scale: 512/64 = 8
+calculate_vae_tile_positions(int pixel_width, int pixel_height,
+                             int vae_tile_size) {
+  const int scale_factor = 8;  // VAE pixel/latent scale
+  const int vae_latent_tile_size = vae_tile_size / scale_factor;
+  const int min_latent_overlap = vae_latent_tile_size / 4;
 
   auto pixel_x_coords = calculate_tile_positions(
       pixel_width, vae_tile_size, min_latent_overlap * scale_factor);
@@ -146,6 +147,24 @@ calculate_vae_tile_positions(int pixel_width, int pixel_height) {
 
   return {pixel_positions, latent_positions, pixel_overlap_x,
           pixel_overlap_y, latent_overlap_x, latent_overlap_y};
+}
+
+// Row-major (x, y) tile grid over a latent plane plus the per-axis overlap
+// actually realized by the even spread. Used for tiled UNet steps where the
+// graph runs at a fixed latent tile size.
+inline std::tuple<std::vector<std::pair<int, int>>, int, int>
+calculate_latent_tile_grid(int latent_w, int latent_h, int tile_size,
+                           int min_overlap) {
+  auto xs = calculate_tile_positions(latent_w, tile_size, min_overlap);
+  auto ys = calculate_tile_positions(latent_h, tile_size, min_overlap);
+  std::vector<std::pair<int, int>> positions;
+  positions.reserve(xs.size() * ys.size());
+  for (int y : ys) {
+    for (int x : xs) positions.push_back({x, y});
+  }
+  int overlap_x = xs.size() > 1 ? tile_size - (xs[1] - xs[0]) : 0;
+  int overlap_y = ys.size() > 1 ? tile_size - (ys[1] - ys[0]) : 0;
+  return {positions, overlap_x, overlap_y};
 }
 
 // Per-tile blend weight: linear fade-in over half the overlap on every edge
@@ -252,16 +271,19 @@ inline xt::xarray<float> blend_vae_encoder_tiles(
   return latent;
 }
 
-inline xt::xarray<float> blend_vae_output_tiles(
+// Weighted blend of [1, C, tile, tile] tiles into a [1, C, H, W] plane.
+// Used for both decoded VAE pixel tiles (C=3) and per-step UNet noise
+// prediction tiles (C=4).
+inline xt::xarray<float> blend_output_tiles(
     const std::vector<xt::xarray<float>> &tiles,
     const std::vector<std::pair<int, int>> &positions, int output_h,
     int output_w, int tile_size, int overlap_x, int overlap_y) {
   if (tiles.empty()) {
-    throw std::runtime_error(
-        "Tile list cannot be empty for VAE output blending.");
+    throw std::runtime_error("Tile list cannot be empty for tile blending.");
   }
 
-  std::vector<int> accumulated_shape = {1, 3, output_h, output_w};
+  const int channels = (int)tiles[0].shape()[1];
+  std::vector<int> accumulated_shape = {1, channels, output_h, output_w};
   xt::xarray<float> accumulated = xt::zeros<float>(accumulated_shape);
   xt::xarray<float> weight_map = xt::zeros<float>({output_h, output_w});
 
@@ -275,7 +297,7 @@ inline xt::xarray<float> blend_vae_output_tiles(
     xt::xarray<float> tile_weight = make_tile_fade_weight(
         tile_size, x, y, output_w, output_h, fade_size_x, fade_size_y);
 
-    for (int c = 0; c < 3; ++c) {
+    for (int c = 0; c < channels; ++c) {
       auto acc_slice = xt::view(accumulated, 0, c, xt::range(y, y + tile_size),
                                 xt::range(x, x + tile_size));
       auto tile_slice = xt::view(tiles[idx], 0, c, xt::all(), xt::all());
