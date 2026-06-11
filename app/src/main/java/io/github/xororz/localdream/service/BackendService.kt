@@ -8,16 +8,32 @@ import androidx.core.app.NotificationCompat
 import io.github.xororz.localdream.BuildConfig
 import io.github.xororz.localdream.R
 import io.github.xororz.localdream.data.Model
-import io.github.xororz.localdream.data.ModelRepository
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 
 class BackendService : Service() {
+    @Volatile
     private var process: Process? = null
     private lateinit var runtimeDir: File
+
+    @Volatile
+    private var runtimeDirReady = false
+
+    // All backend process management (asset copies, exec, destroy/waitFor)
+    // runs on this single thread: jobs stay ordered relative to each other
+    // and the main thread never blocks on waitFor() or large file copies.
+    private val backendDispatcher =
+        Executors.newSingleThreadExecutor { r -> Thread(r, "backend-control") }
+            .asCoroutineDispatcher()
+    private val serviceScope = CoroutineScope(SupervisorJob() + backendDispatcher)
 
     companion object {
         private const val TAG = "BackendService"
@@ -50,7 +66,7 @@ class BackendService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        prepareRuntimeDir()
+        serviceScope.launch { prepareRuntimeDir() }
     }
 
     override fun onBind(intent: Intent): IBinder? = null
@@ -62,35 +78,38 @@ class BackendService : Service() {
             createNotification(this.getString(R.string.backend_notify)),
         )
 
-        when (intent?.action) {
-            ACTION_STOP -> {
-                Log.d("GenerationService", "stop")
-                stopSelf()
-                return START_NOT_STICKY
-            }
+        if (intent?.action == ACTION_STOP) {
+            Log.d("GenerationService", "stop")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        val isRestart = intent?.action == ACTION_RESTART
 
-            ACTION_RESTART -> {
+        val modelId = intent?.getStringExtra("modelId")
+        // Backend type is decided by the caller (it already has the Model);
+        // re-deriving it here would require a full model-directory scan.
+        val backendType = intent?.getStringExtra("backendType")
+        val width = intent?.getIntExtra("width", 512) ?: 512
+        val height = intent?.getIntExtra("height", 512) ?: 512
+        serviceScope.launch {
+            if (isRestart) {
                 Log.i(TAG, "restarting backend service")
                 stopBackend()
             }
-        }
-
-        val modelId = intent?.getStringExtra("modelId")
-        val width = intent?.getIntExtra("width", 512) ?: 512
-        val height = intent?.getIntExtra("height", 512) ?: 512
-        if (modelId != null) {
-            val modelRepository = ModelRepository(this)
-            val model = modelRepository.models.find { it.id == modelId }
-
-            if (model != null) {
-                if (startBackend(model, width, height)) {
-                    updateState(BackendState.Running)
-                } else {
-                    updateState(BackendState.Error("Backend start failed"))
+            if (modelId == null) return@launch
+            when {
+                backendType == null -> {
+                    updateState(BackendState.Error("Model not found"))
+                    stopSelf()
                 }
-            } else {
-                updateState(BackendState.Error("Model not found"))
-                stopSelf()
+
+                // prepareRuntimeDir already published its own error state.
+                !runtimeDirReady -> stopSelf()
+
+                startBackend(modelId, backendType, width, height) ->
+                    updateState(BackendState.Running)
+
+                else -> updateState(BackendState.Error("Backend start failed"))
             }
         }
 
@@ -112,13 +131,13 @@ class BackendService : Service() {
         updateState(BackendState.Error("Service timeout"))
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
-        Thread {
+        serviceScope.launch {
             try {
                 stopBackend()
             } catch (e: Exception) {
                 Log.e(TAG, "stopBackend on timeout failed", e)
             }
-        }.apply { isDaemon = true }.start()
+        }
     }
 
     private fun createNotificationChannel() {
@@ -193,20 +212,25 @@ class BackendService : Service() {
 
             if (BuildConfig.FLAVOR == "filter") {
                 try {
-                    val safetyCheckerSource = assets.open("safety_checker.mnn")
                     val safetyCheckerTarget = File(filesDir, "safety_checker.mnn")
+                    val assetSize = assets.open("safety_checker.mnn")
+                        .use { it.available().toLong() }
 
-                    safetyCheckerSource.use { input ->
-                        safetyCheckerTarget.outputStream().use { output ->
-                            input.copyTo(output)
+                    if (!safetyCheckerTarget.exists() ||
+                        safetyCheckerTarget.length() != assetSize
+                    ) {
+                        assets.open("safety_checker.mnn").use { input ->
+                            safetyCheckerTarget.outputStream().use { output ->
+                                input.copyTo(output)
+                            }
                         }
+                        Log.i(
+                            TAG,
+                            "Safety checker model copied to: ${safetyCheckerTarget.absolutePath}",
+                        )
                     }
 
                     safetyCheckerTarget.setReadable(true, true)
-                    Log.i(
-                        TAG,
-                        "Safety checker model copied to: ${safetyCheckerTarget.absolutePath}",
-                    )
                 } catch (e: IOException) {
                     Log.e(TAG, "copy safety_checker.mnn failed", e)
                     throw RuntimeException("Failed to copy safety checker model", e)
@@ -215,23 +239,23 @@ class BackendService : Service() {
 
             runtimeDir.setReadable(true, true)
             runtimeDir.setExecutable(true, true)
+            runtimeDirReady = true
 
             Log.i(TAG, "Runtime directory prepared: ${runtimeDir.absolutePath}")
             Log.i(TAG, "Runtime files: ${runtimeDir.list()?.joinToString()}")
         } catch (e: Exception) {
             Log.e(TAG, "Prepare runtime dir failed", e)
             updateState(BackendState.Error("Prepare runtime dir failed: ${e.message}"))
-            throw RuntimeException("Failed to prepare runtime directory", e)
         }
     }
 
-    private fun startBackend(model: Model, width: Int, height: Int): Boolean {
-        Log.i(TAG, "backend start, model: ${model.name}, resolution: $width×$height")
+    private fun startBackend(modelId: String, backendType: String, width: Int, height: Int): Boolean {
+        Log.i(TAG, "backend start, model: $modelId, resolution: $width×$height")
         updateState(BackendState.Starting)
 
         try {
             val nativeDir = applicationInfo.nativeLibraryDir
-            val modelsDir = File(Model.getModelsDir(this), model.id)
+            val modelsDir = File(Model.getModelsDir(this), modelId)
 
             val executableFile = File(nativeDir, EXECUTABLE_NAME)
 
@@ -247,19 +271,19 @@ class BackendService : Service() {
             val command = mutableListOf(
                 executableFile.absolutePath,
                 "--type",
-                model.backendType,
+                backendType,
                 "--model_dir",
                 modelsDir.absolutePath,
                 "--port",
                 "8081",
             )
-            if (!model.runOnCpu) {
+            if (backendType != "sd15cpu") {
                 command += listOf("--lib_dir", runtimeDir.absolutePath)
             }
             if (!useImg2img) {
                 command += "--no_img2img"
             }
-            if (model.backendType == "sd15npu" && (width != 512 || height != 512)) {
+            if (backendType == "sd15npu" && (width != 512 || height != 512)) {
                 val patchFile = if (width == height) {
                     val squarePatch = File(modelsDir, "$width.patch")
                     if (squarePatch.exists()) {
@@ -290,7 +314,7 @@ class BackendService : Service() {
                     File(filesDir, "safety_checker.mnn").absolutePath,
                 )
             }
-            if (model.isSdxl && preferences.getBoolean("sdxl_lowram", true)) {
+            if (backendType == "sdxl" && preferences.getBoolean("sdxl_lowram", true)) {
                 command += "--lowram"
             }
             if (listenOnAll) {
@@ -381,10 +405,16 @@ class BackendService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        stopBackend()
+        // The scope is never cancelled, so this job still runs after
+        // onDestroy returns; closing the dispatcher afterwards lets its
+        // thread wind down once the backend process has exited.
+        serviceScope.launch {
+            stopBackend()
+            backendDispatcher.close()
+        }
     }
 
-    fun stopBackend() {
+    private fun stopBackend() {
         Log.i(TAG, "to stop backend")
         process?.let { proc ->
             try {

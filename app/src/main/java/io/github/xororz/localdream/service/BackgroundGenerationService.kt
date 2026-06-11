@@ -7,10 +7,12 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.os.IBinder
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.graphics.createBitmap
 import io.github.xororz.localdream.R
+import io.github.xororz.localdream.utils.Http
 import java.io.BufferedReader
 import java.io.File
 import java.io.IOException
@@ -20,6 +22,7 @@ import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -28,11 +31,24 @@ import org.json.JSONObject
 class BackgroundGenerationService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
     private val notificationManager by lazy { getSystemService(NOTIFICATION_SERVICE) as NotificationManager }
+    private var lastProgressNotifyAt = 0L
 
     companion object {
         private const val CHANNEL_ID = "image_generation_channel"
         private const val NOTIFICATION_ID = 1
         const val ACTION_STOP = "stop_generation"
+
+        // Shared across generations; the long timeouts cover a single SDXL
+        // request that can stream for many minutes.
+        private val generationClient: OkHttpClient by lazy {
+            Http.client.newBuilder()
+                .connectTimeout(3600, TimeUnit.SECONDS)
+                .readTimeout(3600, TimeUnit.SECONDS)
+                .writeTimeout(3600, TimeUnit.SECONDS)
+                .callTimeout(3600, TimeUnit.SECONDS)
+                .retryOnConnectionFailure(true)
+                .build()
+        }
 
         private val _generationState = MutableStateFlow<GenerationState>(GenerationState.Idle)
         val generationState: StateFlow<GenerationState> = _generationState
@@ -225,20 +241,12 @@ class BackgroundGenerationService : Service() {
                 mask?.let { put("mask", it) }
             }
 
-            val client = OkHttpClient.Builder()
-                .connectTimeout(3600, TimeUnit.SECONDS)
-                .readTimeout(3600, TimeUnit.SECONDS)
-                .writeTimeout(3600, TimeUnit.SECONDS)
-                .callTimeout(3600, TimeUnit.SECONDS)
-                .retryOnConnectionFailure(true)
-                .build()
-
             val request = Request.Builder()
                 .url("http://localhost:8081/generate")
                 .post(jsonObject.toString().toRequestBody("application/json".toMediaTypeOrNull()))
                 .build()
 
-            client.newCall(request).execute().use { response ->
+            generationClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     throw IOException(
                         this@BackgroundGenerationService.getString(
@@ -253,6 +261,10 @@ class BackgroundGenerationService : Service() {
 
                     val reader = BufferedReader(InputStreamReader(responseBody.byteStream()))
                     var messageCount = 0
+                    // Reused across progress previews: with the diffusion
+                    // process shown every step would otherwise allocate a
+                    // fresh width*height IntArray (4 MB at 1024x1024).
+                    var previewPixels: IntArray? = null
 
                     // Read line by line for efficiency
                     while (isActive) {
@@ -285,7 +297,11 @@ class BackgroundGenerationService : Service() {
                                             // path doesn't ship the 1024 canvas every step.
                                             val pw = effectiveWidth
                                             val ph = effectiveHeight
-                                            val pixels = IntArray(pw * ph)
+                                            val pixels = previewPixels
+                                                ?.takeIf { it.size == pw * ph }
+                                                ?: IntArray(pw * ph).also {
+                                                    previewPixels = it
+                                                }
                                             for (i in 0 until pw * ph) {
                                                 val index = i * 3
                                                 if (index + 2 < imageBytes.size) {
@@ -396,16 +412,14 @@ class BackgroundGenerationService : Service() {
 
                                     // Wait for UI to consume the bitmap with timeout
                                     val waitStartTime = System.currentTimeMillis()
-                                    val timeoutMs = 5000L // 5 seconds timeout
-                                    while (!_bitmapConsumed.value && isActive) {
-                                        if (System.currentTimeMillis() - waitStartTime > timeoutMs) {
-                                            Log.w(
-                                                "BgGenService",
-                                                "Timeout waiting for bitmap consumption",
-                                            )
-                                            break
-                                        }
-                                        delay(100)
+                                    val consumed = withTimeoutOrNull(5000L) {
+                                        _bitmapConsumed.first { it }
+                                    }
+                                    if (consumed == null) {
+                                        Log.w(
+                                            "BgGenService",
+                                            "Timeout waiting for bitmap consumption",
+                                        )
                                     }
 
                                     Log.d(
@@ -465,7 +479,6 @@ class BackgroundGenerationService : Service() {
             .setContentTitle(this.getString(R.string.generating_notify))
             .setContentText("Progress: ${(progress * 100).toInt()}%")
             .setProgress(100, (progress * 100).toInt(), false)
-            .setSmallIcon(android.R.drawable.ic_popup_sync)
             .setSmallIcon(R.drawable.ic_launcher_monochrome)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
@@ -473,6 +486,11 @@ class BackgroundGenerationService : Service() {
     }
 
     private fun updateNotification(progress: Float) {
+        // The system rate-limits notification updates; posting one per
+        // diffusion step just gets dropped, so throttle to ~2 per second.
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastProgressNotifyAt < 500) return
+        lastProgressNotifyAt = now
         notificationManager.notify(NOTIFICATION_ID, createNotification(progress))
     }
 

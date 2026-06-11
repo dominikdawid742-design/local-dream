@@ -86,7 +86,8 @@ fun UpscaleScreen(navController: NavController, modifier: Modifier = Modifier) {
     var sharedOffsetY by remember { mutableFloatStateOf(0f) }
 
     var showUpscalerDialog by remember { mutableStateOf(false) }
-    val upscalerRepository = remember { UpscalerRepository(context) }
+    val upscalerRepository = remember { UpscalerRepository.getInstance(context) }
+    LaunchedEffect(Unit) { upscalerRepository.ensureLoaded() }
     val upscalerPreferences =
         remember { context.getSharedPreferences("upscaler_prefs", Context.MODE_PRIVATE) }
 
@@ -623,54 +624,56 @@ fun UpscaleScreen(navController: NavController, modifier: Modifier = Modifier) {
         var downloadingUpscalerId by remember { mutableStateOf<String?>(null) }
         var downloadProgress by remember { mutableStateOf<DownloadProgress?>(null) }
 
-        val downloadState by ModelDownloadService.downloadState.collectAsState()
-
-        LaunchedEffect(downloadState) {
-            when (val state = downloadState) {
-                is ModelDownloadService.DownloadState.Downloading -> {
-                    val upscaler = upscalerRepository.upscalers.find { it.id == state.modelId }
-                    if (upscaler != null) {
-                        downloadingUpscalerId = upscaler.id
-                        downloadProgress = DownloadProgress(
-                            progress = state.progress,
-                            downloadedBytes = state.downloadedBytes,
-                            totalBytes = state.totalBytes,
-                        )
+        LaunchedEffect(Unit) {
+            ModelDownloadService.downloadState.collect { state ->
+                when (state) {
+                    is ModelDownloadService.DownloadState.Downloading -> {
+                        val upscaler =
+                            upscalerRepository.upscalers.find { it.id == state.modelId }
+                        if (upscaler != null) {
+                            downloadingUpscalerId = upscaler.id
+                            downloadProgress = DownloadProgress(
+                                progress = state.progress,
+                                downloadedBytes = state.downloadedBytes,
+                                totalBytes = state.totalBytes,
+                            )
+                        }
                     }
-                }
 
-                is ModelDownloadService.DownloadState.Success -> {
-                    upscalerRepository.refreshUpscalerState(state.modelId)
-                    downloadingUpscalerId = null
-                    downloadProgress = null
-                    Toast.makeText(
-                        context,
-                        msgDownloadDone,
-                        Toast.LENGTH_SHORT,
-                    ).show()
-                }
-
-                is ModelDownloadService.DownloadState.Error -> {
-                    downloadingUpscalerId = null
-                    downloadProgress = null
-                    Toast.makeText(
-                        context,
-                        msgErrorDownloadFailed.format(state.message),
-                        Toast.LENGTH_SHORT,
-                    ).show()
-                }
-
-                is ModelDownloadService.DownloadState.Extracting -> {
-                    val upscaler = upscalerRepository.upscalers.find { it.id == state.modelId }
-                    if (upscaler != null) {
-                        downloadingUpscalerId = upscaler.id
-                        downloadProgress = null // Indeterminate progress during extraction
-                    }
-                }
-
-                is ModelDownloadService.DownloadState.Idle -> {
-                    if (downloadingUpscalerId != null && downloadProgress == null) {
+                    is ModelDownloadService.DownloadState.Success -> {
+                        upscalerRepository.refreshUpscalerState(state.modelId)
                         downloadingUpscalerId = null
+                        downloadProgress = null
+                        Toast.makeText(
+                            context,
+                            msgDownloadDone,
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+
+                    is ModelDownloadService.DownloadState.Error -> {
+                        downloadingUpscalerId = null
+                        downloadProgress = null
+                        Toast.makeText(
+                            context,
+                            msgErrorDownloadFailed.format(state.message),
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+
+                    is ModelDownloadService.DownloadState.Extracting -> {
+                        val upscaler =
+                            upscalerRepository.upscalers.find { it.id == state.modelId }
+                        if (upscaler != null) {
+                            downloadingUpscalerId = upscaler.id
+                            downloadProgress = null // Indeterminate progress during extraction
+                        }
+                    }
+
+                    is ModelDownloadService.DownloadState.Idle -> {
+                        if (downloadingUpscalerId != null && downloadProgress == null) {
+                            downloadingUpscalerId = null
+                        }
                     }
                 }
             }

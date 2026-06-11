@@ -9,6 +9,7 @@ import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import io.github.xororz.localdream.R
+import io.github.xororz.localdream.utils.Http
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.TimeUnit
@@ -32,7 +33,7 @@ class ModelDownloadService : Service() {
         getSystemService(NOTIFICATION_SERVICE) as NotificationManager
     }
 
-    private val client = OkHttpClient.Builder()
+    private val client = Http.client.newBuilder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .build()

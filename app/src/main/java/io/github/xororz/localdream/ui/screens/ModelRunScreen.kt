@@ -66,6 +66,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
@@ -138,6 +139,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -205,6 +207,7 @@ import io.github.xororz.localdream.ui.components.ShareParametersDialog
 import io.github.xororz.localdream.ui.components.SmoothLinearWavyProgressIndicator
 import io.github.xororz.localdream.ui.components.ZoomableImageOverlay
 import io.github.xororz.localdream.ui.theme.Motion
+import io.github.xororz.localdream.utils.Http
 import io.github.xororz.localdream.utils.ImportedParams
 import io.github.xororz.localdream.utils.LogCapture
 import io.github.xororz.localdream.utils.ParamShare
@@ -228,186 +231,12 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
-
-// Prompt undo/redo: cap on stored steps, and the window within which continuous
-// typing collapses into a single step.
-private const val HISTORY_LIMIT = 100
-private const val HISTORY_COALESCE_MS = 600L
-
-private fun checkStoragePermission(context: Context): Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-    true // Android 10
-} else {
-    ContextCompat.checkSelfPermission(
-        context,
-        Manifest.permission.WRITE_EXTERNAL_STORAGE,
-    ) == PackageManager.PERMISSION_GRANTED
-}
-
-private val tokenizeClient: OkHttpClient by lazy {
-    OkHttpClient.Builder()
-        .connectTimeout(2, TimeUnit.SECONDS)
-        .readTimeout(5, TimeUnit.SECONDS)
-        .writeTimeout(5, TimeUnit.SECONDS)
-        .build()
-}
-
-private data class TokenizeResult(val count: Int, val maxLength: Int, val overflowOffset: Int)
-
-private suspend fun tokenizePromptRequest(text: String): TokenizeResult? = withContext(Dispatchers.IO) {
-    try {
-        val body = JSONObject().apply { put("prompt", text) }
-            .toString()
-            .toRequestBody("application/json".toMediaTypeOrNull())
-        val request = Request.Builder()
-            .url("http://localhost:8081/tokenize")
-            .post(body)
-            .build()
-        tokenizeClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) return@withContext null
-            val payload = response.body?.string() ?: return@withContext null
-            val json = JSONObject(payload)
-            TokenizeResult(
-                count = json.optInt("count", 0),
-                maxLength = json.optInt("max_length", 77),
-                overflowOffset = json.optInt("overflow_offset", -1),
-            )
-        }
-    } catch (_: Exception) {
-        null
-    }
-}
-
-private suspend fun checkBackendHealth(
-    backendState: StateFlow<BackendService.BackendState>,
-    onHealthy: () -> Unit,
-    onUnhealthy: () -> Unit,
-) = withContext(Dispatchers.IO) {
-    try {
-        val client = OkHttpClient.Builder()
-            .connectTimeout(100, TimeUnit.MILLISECONDS) // 100ms
-            .build()
-
-        val startTime = System.currentTimeMillis()
-//        val timeoutDuration = 10000
-        val timeoutDuration = 60000
-
-        while (currentCoroutineContext().isActive) {
-            if (backendState.value is BackendService.BackendState.Error) {
-                withContext(Dispatchers.Main) {
-                    onUnhealthy()
-                }
-                break
-            }
-
-            if (System.currentTimeMillis() - startTime > timeoutDuration) {
-                withContext(Dispatchers.Main) {
-                    onUnhealthy()
-                }
-                break
-            }
-
-            try {
-                val request = Request.Builder()
-                    .url("http://localhost:8081/health")
-                    .get()
-                    .build()
-
-                val response = client.newCall(request).execute()
-                if (response.isSuccessful) {
-                    withContext(Dispatchers.Main) {
-                        onHealthy()
-                    }
-                    break
-                }
-            } catch (e: Exception) {
-                // e
-            }
-
-            delay(100)
-        }
-    } catch (e: Exception) {
-        withContext(Dispatchers.Main) {
-            onUnhealthy()
-        }
-    }
-}
-
-/**
- * For SDXL with a non-1:1 aspectRatio, returns the centered (target_w, target_h)
- * region inside the 1024x1024 generation canvas. The longest side is forced to
- * canvasMax (1024), the shortest side is scaled by the ratio and aligned down to
- * a multiple of 8. Returns null in all other cases (non-SDXL, 1:1, malformed),
- * meaning "no padding, use canvas size directly."
- */
-fun computeAspectTargetSize(isSdxl: Boolean, aspectRatio: String, canvasMax: Int = 1024): Pair<Int, Int>? {
-    if (!isSdxl) return null
-    val parts = aspectRatio.split(":")
-    if (parts.size != 2) return null
-    val rw = parts[0].toIntOrNull() ?: return null
-    val rh = parts[1].toIntOrNull() ?: return null
-    if (rw <= 0 || rh <= 0 || rw == rh) return null
-    return if (rw >= rh) {
-        val th = ((canvasMax.toDouble() * rh / rw).toInt() / 8 * 8).coerceAtLeast(8)
-        Pair(canvasMax, th)
-    } else {
-        val tw = ((canvasMax.toDouble() * rw / rh).toInt() / 8 * 8).coerceAtLeast(8)
-        Pair(tw, canvasMax)
-    }
-}
-
-/**
- * GCD-reduces (width, height) into a "W:H" aspect-ratio string.
- * Used by reproduce/import paths to recover an aspect from a recorded result size.
- */
-fun inferAspectRatioString(width: Int, height: Int): String {
-    if (width <= 0 || height <= 0) return "1:1"
-    var a = width
-    var b = height
-    while (b != 0) {
-        val t = b
-        b = a % b
-        a = t
-    }
-    return "${width / a}:${height / a}"
-}
-
-/**
- * Pads `src` (already at targetW x targetH) into a canvas of size canvasW x canvasH
- * with a centered placement and black borders. If src already matches canvas size,
- * returns the source unchanged.
- */
-fun padBitmapToCanvas(src: Bitmap, canvasW: Int, canvasH: Int): Bitmap {
-    if (src.width == canvasW && src.height == canvasH) return src
-    val out = createBitmap(canvasW, canvasH)
-    val canvas = Canvas(out)
-    canvas.drawColor(android.graphics.Color.BLACK)
-    val left = ((canvasW - src.width) / 2).toFloat()
-    val top = ((canvasH - src.height) / 2).toFloat()
-    canvas.drawBitmap(src, left, top, null)
-    return out
-}
-
-@Immutable
-data class GenerationParameters(
-    val steps: Int,
-    val cfg: Float,
-    val seed: Long?,
-    val prompt: String,
-    val negativePrompt: String,
-    val generationTime: String?,
-    val width: Int,
-    val height: Int,
-    val runOnCpu: Boolean,
-    val denoiseStrength: Float = 0.6f,
-    val useOpenCL: Boolean = false,
-    val scheduler: String = "dpm",
-    val mode: GenerationMode = GenerationMode.UNKNOWN,
-)
 
 @SuppressLint("DefaultLocale")
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
@@ -421,16 +250,13 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
     val generationPreferences = remember { GenerationPreferences(context) }
     val coroutineScope = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
-    val modelRepository = remember { ModelRepository(context) }
+    val modelRepository = remember { ModelRepository.getInstance(context) }
 
     // String resources hoisted to composable scope (lint: LocalContextGetResourceValueCall).
     val msgMediaPermissionHint = stringResource(R.string.media_permission_hint)
     val msgBackendFailed = stringResource(R.string.backend_failed)
     val msgImportNoParams = stringResource(R.string.import_no_params)
     val msgImageSaved = stringResource(R.string.image_saved)
-    val msgDownloadDone = stringResource(R.string.download_done)
-    val msgErrorDownloadFailed = stringResource(R.string.error_download_failed)
-    val msgDownloadModelFirst = stringResource(R.string.download_model_first)
     val msgDeleted = stringResource(R.string.deleted)
     val msgDeleteFailedMessage = stringResource(R.string.delete_failed_message)
     val msgShareCopied = stringResource(R.string.share_copied)
@@ -438,7 +264,10 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
     val msgUpscaleFailed = stringResource(R.string.upscale_failed)
     val msgSavedCountWithFailed = stringResource(R.string.saved_count_with_failed)
     val msgDeletedCountWithFailed = stringResource(R.string.deleted_count_with_failed)
-    val model = remember { modelRepository.models.find { it.id == modelId } }
+    // Reaches the screen with the repository already loaded on the normal
+    // navigation path; resolves asynchronously after process recreation.
+    val model = remember(modelRepository.models) { modelRepository.models.find { it.id == modelId } }
+    LaunchedEffect(Unit) { modelRepository.ensureLoaded() }
     val historyManager = remember { HistoryManager(context) }
     val scrollBehavior =
         TopAppBarDefaults.exitUntilCollapsedScrollBehavior(rememberTopAppBarState())
@@ -510,46 +339,12 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                 prompt = "",
                 negativePrompt = "",
                 generationTime = "",
-                width = if (model?.isSdxl == true) {
-                    1024
-                } else if (model?.runOnCpu == true) {
-                    256
-                } else {
-                    512
-                },
-                height = if (model?.isSdxl == true) {
-                    1024
-                } else if (model?.runOnCpu == true) {
-                    256
-                } else {
-                    512
-                },
+                width = defaultGenerationSize(model?.isSdxl == true, model?.runOnCpu == true),
+                height = defaultGenerationSize(model?.isSdxl == true, model?.runOnCpu == true),
                 runOnCpu = model?.runOnCpu ?: false,
             ),
         )
     }
-    var prompt by remember { mutableStateOf("") }
-    var negativePrompt by remember { mutableStateOf("") }
-    var promptFieldValue by remember { mutableStateOf(TextFieldValue("")) }
-    var negativePromptFieldValue by remember { mutableStateOf(TextFieldValue("")) }
-    var promptSuggestions by remember { mutableStateOf<List<TagSuggestion>>(emptyList()) }
-    var negativePromptSuggestions by remember { mutableStateOf<List<TagSuggestion>>(emptyList()) }
-    var promptActiveQuery by remember { mutableStateOf<String?>(null) }
-    var negativePromptActiveQuery by remember { mutableStateOf<String?>(null) }
-    var isPromptFocused by remember { mutableStateOf(false) }
-    var isNegativePromptFocused by remember { mutableStateOf(false) }
-    // Undo/redo history of the prompt text. Rapid typing coalesces into a single
-    // step; suggestion picks and toolbar edits are discrete steps.
-    var promptUndoStack by remember { mutableStateOf<List<String>>(emptyList()) }
-    var promptRedoStack by remember { mutableStateOf<List<String>>(emptyList()) }
-    var promptHistoryAt by remember { mutableLongStateOf(0L) }
-    var negativePromptUndoStack by remember { mutableStateOf<List<String>>(emptyList()) }
-    var negativePromptRedoStack by remember { mutableStateOf<List<String>>(emptyList()) }
-    var negativePromptHistoryAt by remember { mutableLongStateOf(0L) }
-    // Set when the back gesture dismisses the popup; reset on the next edit so the
-    // popup stays closed until the user actually does something again.
-    var promptPopupDismissed by remember { mutableStateOf(false) }
-    var negativePromptPopupDismissed by remember { mutableStateOf(false) }
     var cfg by remember { mutableFloatStateOf(GenerationDefaults.GLOBAL.cfg) }
     var steps by remember { mutableFloatStateOf(GenerationDefaults.GLOBAL.steps) }
     var seed by remember { mutableStateOf(GenerationDefaults.GLOBAL.seed) }
@@ -569,7 +364,7 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
     var isCheckingBackend by remember { mutableStateOf(true) }
     var showExitDialog by remember { mutableStateOf(false) }
     var showParametersDialog by remember { mutableStateOf(false) }
-    var pagerState = rememberPagerState(initialPage = 0, pageCount = { 3 })
+    val pagerState = rememberPagerState(initialPage = 0, pageCount = { 3 })
     var generationStartTime by remember { mutableStateOf<Long?>(null) }
     var hasInitialized by remember { mutableStateOf(false) }
     var showReportDialog by remember { mutableStateOf(false) }
@@ -584,30 +379,10 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
     }
 
     var currentWidth by remember {
-        mutableIntStateOf(
-            if (model?.isSdxl ==
-                true
-            ) {
-                1024
-            } else if (model?.runOnCpu == true) {
-                256
-            } else {
-                512
-            },
-        )
+        mutableIntStateOf(defaultGenerationSize(model?.isSdxl == true, model?.runOnCpu == true))
     }
     var currentHeight by remember {
-        mutableIntStateOf(
-            if (model?.isSdxl ==
-                true
-            ) {
-                1024
-            } else if (model?.runOnCpu == true) {
-                256
-            } else {
-                512
-            },
-        )
+        mutableIntStateOf(defaultGenerationSize(model?.isSdxl == true, model?.runOnCpu == true))
     }
     var availableResolutions by remember { mutableStateOf<List<Resolution>>(emptyList()) }
     var showResolutionChangeDialog by remember { mutableStateOf(false) }
@@ -616,9 +391,14 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
     var showAdvancedSettings by remember { mutableStateOf(false) }
 
     var isPreviewMode by remember { mutableStateOf(false) }
-    val preferences = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
-    val useImg2img = preferences.getBoolean("use_img2img", true)
-    val enableTagAutocomplete = preferences.getBoolean("enable_tag_autocomplete", true)
+    val preferences = remember {
+        context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+    }
+    // Both settings can only change on the model list screen, so a snapshot
+    // taken once per screen entry is enough; re-reading on every recomposition
+    // would hit SharedPreferences in the hottest path of this composable.
+    val useImg2img = remember { preferences.getBoolean("use_img2img", true) }
+    val enableTagAutocomplete = remember { preferences.getBoolean("enable_tag_autocomplete", true) }
     val tagSuggestionCount = 128
     val tagAutocompleteRepository = remember { TagAutocompleteRepository.getInstance(context) }
     val tagDictState by tagAutocompleteRepository.state.collectAsState()
@@ -634,8 +414,52 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
     // when either prompt field gains focus so newly-imported embeddings show up
     // without re-entering the screen.
     var embeddingNames by remember { mutableStateOf<List<String>>(emptyList()) }
-    LaunchedEffect(isPromptFocused, isNegativePromptFocused) {
-        if (!isPromptFocused && !isNegativePromptFocused) return@LaunchedEffect
+
+    // Build embedding TagSuggestion rows for the current query. Returns at most
+    // `limit` entries: prefix matches first, then contains matches. Comparison
+    // normalizes spaces/dashes to underscores so users typing either form match.
+    fun embeddingSuggestionsFor(query: String, limit: Int = 5): List<TagSuggestion> {
+        if (embeddingNames.isEmpty()) return emptyList()
+        val q = query.trim()
+            .lowercase()
+            .replace(' ', '_')
+            .replace('-', '_')
+        if (q.isEmpty()) return emptyList()
+        val prefix = mutableListOf<TagSuggestion>()
+        val contains = mutableListOf<TagSuggestion>()
+        for (name in embeddingNames) {
+            val normalized = name.lowercase().replace(' ', '_').replace('-', '_')
+            val idx = normalized.indexOf(q)
+            if (idx < 0) continue
+            val suggestion = TagSuggestion(
+                replacementTag = name,
+                primaryText = name,
+                secondaryText = null,
+                matchType = TagMatchType.Embedding,
+                category = 0,
+                postCount = 0,
+                score = 0,
+            )
+            if (idx == 0) prefix += suggestion else contains += suggestion
+        }
+        return (prefix + contains).take(limit)
+    }
+
+    val promptField = rememberPromptFieldController(
+        repository = tagAutocompleteRepository,
+        suggestionCount = tagSuggestionCount,
+        embeddingSuggestionsFor = { embeddingSuggestionsFor(it) },
+    )
+    val negativePromptField = rememberPromptFieldController(
+        repository = tagAutocompleteRepository,
+        suggestionCount = tagSuggestionCount,
+        embeddingSuggestionsFor = { embeddingSuggestionsFor(it) },
+    )
+    promptField.autocompleteAvailable = tagAutocompleteAvailable
+    negativePromptField.autocompleteAvailable = tagAutocompleteAvailable
+
+    LaunchedEffect(promptField.isFocused, negativePromptField.isFocused) {
+        if (!promptField.isFocused && !negativePromptField.isFocused) return@LaunchedEffect
         val names = withContext(Dispatchers.IO) {
             File(context.filesDir, "embeddings")
                 .takeIf { it.isDirectory }
@@ -683,7 +507,7 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
     // Upscaler related states
     var showUpscalerDialog by remember { mutableStateOf(false) }
     var isUpscaling by remember { mutableStateOf(false) }
-    val upscalerRepository = remember { UpscalerRepository(context) }
+    val upscalerRepository = remember { UpscalerRepository.getInstance(context) }
     val upscalerPreferences =
         remember { context.getSharedPreferences("upscaler_prefs", Context.MODE_PRIVATE) }
 
@@ -714,8 +538,8 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
             delay(1000)
             generationPreferences.saveAllFields(
                 modelId = modelId,
-                prompt = prompt,
-                negativePrompt = negativePrompt,
+                prompt = promptField.text,
+                negativePrompt = negativePromptField.text,
                 steps = steps,
                 cfg = cfg,
                 seed = seed,
@@ -764,281 +588,11 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
             saveAllFields()
         }
     }
-    var promptSuggestJob by remember { mutableStateOf<Job?>(null) }
-    var negativePromptSuggestJob by remember { mutableStateOf<Job?>(null) }
+    promptField.onTextCommitted = { saveAllFields() }
+    negativePromptField.onTextCommitted = { saveAllFields() }
 
-    var promptTokenCount by remember { mutableIntStateOf(2) }
-    var negativePromptTokenCount by remember { mutableIntStateOf(2) }
-    var promptTokenMax by remember { mutableIntStateOf(77) }
-    var negativePromptTokenMax by remember { mutableIntStateOf(77) }
-    // UTF-16 index from which the prompt exceeds the token limit, or -1 when it
-    // fits. Drives the greyed-out overflow hint in the prompt fields.
-    var promptOverflowOffset by remember { mutableIntStateOf(-1) }
-    var negativePromptOverflowOffset by remember { mutableIntStateOf(-1) }
-
-    LaunchedEffect(prompt, isCheckingBackend) {
-        if (isCheckingBackend) return@LaunchedEffect
-        delay(400)
-        val result = tokenizePromptRequest(prompt) ?: return@LaunchedEffect
-        promptTokenCount = result.count
-        promptTokenMax = result.maxLength
-        promptOverflowOffset = result.overflowOffset
-    }
-    LaunchedEffect(negativePrompt, isCheckingBackend) {
-        if (isCheckingBackend) return@LaunchedEffect
-        delay(400)
-        val result = tokenizePromptRequest(negativePrompt) ?: return@LaunchedEffect
-        negativePromptTokenCount = result.count
-        negativePromptTokenMax = result.maxLength
-        negativePromptOverflowOffset = result.overflowOffset
-    }
-
-    // Build embedding TagSuggestion rows for the current query. Returns at most
-    // `limit` entries: prefix matches first, then contains matches. Comparison
-    // normalizes spaces/dashes to underscores so users typing either form match.
-    fun embeddingSuggestionsFor(query: String, limit: Int = 5): List<TagSuggestion> {
-        if (embeddingNames.isEmpty()) return emptyList()
-        val q = query.trim()
-            .lowercase()
-            .replace(' ', '_')
-            .replace('-', '_')
-        if (q.isEmpty()) return emptyList()
-        val prefix = mutableListOf<TagSuggestion>()
-        val contains = mutableListOf<TagSuggestion>()
-        for (name in embeddingNames) {
-            val normalized = name.lowercase().replace(' ', '_').replace('-', '_')
-            val idx = normalized.indexOf(q)
-            if (idx < 0) continue
-            val suggestion = TagSuggestion(
-                replacementTag = name,
-                primaryText = name,
-                secondaryText = null,
-                matchType = TagMatchType.Embedding,
-                category = 0,
-                postCount = 0,
-                score = 0,
-            )
-            if (idx == 0) prefix += suggestion else contains += suggestion
-        }
-        return (prefix + contains).take(limit)
-    }
-
-    // Records `snapshot` as an undo checkpoint. Continuous typing within the
-    // coalesce window collapses into one step; discrete edits (suggestion picks,
-    // toolbar actions) pass coalesce = false to always start a new step.
-    fun pushPromptHistory(snapshot: String, coalesce: Boolean) {
-        val now = System.currentTimeMillis()
-        val skip = coalesce && promptUndoStack.isNotEmpty() && now - promptHistoryAt < HISTORY_COALESCE_MS
-        if (!skip) {
-            promptUndoStack = (promptUndoStack + snapshot).takeLast(HISTORY_LIMIT)
-        }
-        promptRedoStack = emptyList()
-        // Discrete edits leave the window closed so the next keystroke opens a
-        // fresh step instead of merging into the discrete one.
-        promptHistoryAt = if (coalesce) now else 0L
-    }
-
-    fun updatePromptField(value: TextFieldValue, recordHistory: Boolean = true) {
-        val previousText = promptFieldValue.text
-        val textChanged = value.text != previousText
-        val selectionChanged = value.selection != promptFieldValue.selection
-        if (textChanged && recordHistory) {
-            pushPromptHistory(previousText, coalesce = true)
-        }
-        if (textChanged || selectionChanged) {
-            promptPopupDismissed = false
-        }
-        promptFieldValue = value
-        if (textChanged) {
-            prompt = value.text
-            saveAllFields()
-        }
-        if (!tagAutocompleteAvailable || !isPromptFocused) {
-            promptSuggestJob?.cancel()
-            promptSuggestions = emptyList()
-            promptActiveQuery = null
-            return
-        }
-        if (!textChanged && !selectionChanged) return
-        val activeTag =
-            TagAutocompleteRepository.extractActiveTag(value.text, value.selection.start)
-        if (activeTag == null) {
-            promptSuggestJob?.cancel()
-            promptSuggestions = emptyList()
-            promptActiveQuery = null
-            return
-        }
-        promptActiveQuery = activeTag.token
-        promptSuggestJob?.cancel()
-        promptSuggestJob = scope.launch {
-            delay(200)
-            val embeddings = embeddingSuggestionsFor(activeTag.token)
-            val results = tagAutocompleteRepository.suggest(activeTag.token, tagSuggestionCount)
-            // Embeddings always pinned to the top; their relevance is local to
-            // this user, so they outrank dictionary suggestions by construction.
-            promptSuggestions = embeddings + results
-        }
-    }
-
-    fun pushNegativePromptHistory(snapshot: String, coalesce: Boolean) {
-        val now = System.currentTimeMillis()
-        val skip = coalesce && negativePromptUndoStack.isNotEmpty() &&
-            now - negativePromptHistoryAt < HISTORY_COALESCE_MS
-        if (!skip) {
-            negativePromptUndoStack = (negativePromptUndoStack + snapshot).takeLast(HISTORY_LIMIT)
-        }
-        negativePromptRedoStack = emptyList()
-        negativePromptHistoryAt = if (coalesce) now else 0L
-    }
-
-    fun updateNegativePromptField(value: TextFieldValue, recordHistory: Boolean = true) {
-        val previousText = negativePromptFieldValue.text
-        val textChanged = value.text != previousText
-        val selectionChanged = value.selection != negativePromptFieldValue.selection
-        if (textChanged && recordHistory) {
-            pushNegativePromptHistory(previousText, coalesce = true)
-        }
-        if (textChanged || selectionChanged) {
-            negativePromptPopupDismissed = false
-        }
-        negativePromptFieldValue = value
-        if (textChanged) {
-            negativePrompt = value.text
-            saveAllFields()
-        }
-        if (!tagAutocompleteAvailable || !isNegativePromptFocused) {
-            negativePromptSuggestJob?.cancel()
-            negativePromptSuggestions = emptyList()
-            negativePromptActiveQuery = null
-            return
-        }
-        if (!textChanged && !selectionChanged) return
-        val activeTag =
-            TagAutocompleteRepository.extractActiveTag(value.text, value.selection.start)
-        if (activeTag == null) {
-            negativePromptSuggestJob?.cancel()
-            negativePromptSuggestions = emptyList()
-            negativePromptActiveQuery = null
-            return
-        }
-        negativePromptActiveQuery = activeTag.token
-        negativePromptSuggestJob?.cancel()
-        negativePromptSuggestJob = scope.launch {
-            delay(200)
-            val embeddings = embeddingSuggestionsFor(activeTag.token)
-            val results = tagAutocompleteRepository.suggest(activeTag.token, tagSuggestionCount)
-            negativePromptSuggestions = embeddings + results
-        }
-    }
-
-    fun applyPromptSuggestion(suggestion: TagSuggestion) {
-        // Discrete history step so an accidental pick can be undone. The popup is
-        // left up (suggestions cleared, but the toolbar persists) for follow-up.
-        pushPromptHistory(promptFieldValue.text, coalesce = false)
-        val (updatedText, updatedSelection) = TagAutocompleteRepository.applySuggestion(
-            promptFieldValue.text,
-            promptFieldValue.selection.start,
-            suggestion,
-        )
-        prompt = updatedText
-        promptFieldValue = TextFieldValue(updatedText, TextRange(updatedSelection))
-        promptSuggestions = emptyList()
-        promptActiveQuery = null
-        promptPopupDismissed = false
-        saveAllFields()
-    }
-
-    fun applyNegativePromptSuggestion(suggestion: TagSuggestion) {
-        pushNegativePromptHistory(negativePromptFieldValue.text, coalesce = false)
-        val (updatedText, updatedSelection) = TagAutocompleteRepository.applySuggestion(
-            negativePromptFieldValue.text,
-            negativePromptFieldValue.selection.start,
-            suggestion,
-        )
-        negativePrompt = updatedText
-        negativePromptFieldValue = TextFieldValue(updatedText, TextRange(updatedSelection))
-        negativePromptSuggestions = emptyList()
-        negativePromptActiveQuery = null
-        negativePromptPopupDismissed = false
-        saveAllFields()
-    }
-
-    // Runs one of the suggestion-toolbar text edits against the prompt field as a
-    // discrete undo step, then routes the result back through updatePromptField so
-    // the suggestions (and the popup) refresh against the new caret position.
-    fun runPromptTagAction(action: (String, Int) -> Pair<String, Int>?) {
-        val (updatedText, updatedSelection) = action(
-            promptFieldValue.text,
-            promptFieldValue.selection.start,
-        ) ?: return
-        pushPromptHistory(promptFieldValue.text, coalesce = false)
-        updatePromptField(
-            TextFieldValue(updatedText, TextRange(updatedSelection)),
-            recordHistory = false,
-        )
-    }
-
-    fun runNegativePromptTagAction(action: (String, Int) -> Pair<String, Int>?) {
-        val (updatedText, updatedSelection) = action(
-            negativePromptFieldValue.text,
-            negativePromptFieldValue.selection.start,
-        ) ?: return
-        pushNegativePromptHistory(negativePromptFieldValue.text, coalesce = false)
-        updateNegativePromptField(
-            TextFieldValue(updatedText, TextRange(updatedSelection)),
-            recordHistory = false,
-        )
-    }
-
-    fun undoPrompt() {
-        if (promptUndoStack.isEmpty()) return
-        val previous = promptUndoStack.last()
-        promptUndoStack = promptUndoStack.dropLast(1)
-        promptRedoStack = (promptRedoStack + promptFieldValue.text).takeLast(HISTORY_LIMIT)
-        promptHistoryAt = 0L
-        updatePromptField(
-            TextFieldValue(previous, TextRange(previous.length)),
-            recordHistory = false,
-        )
-    }
-
-    fun redoPrompt() {
-        if (promptRedoStack.isEmpty()) return
-        val next = promptRedoStack.last()
-        promptRedoStack = promptRedoStack.dropLast(1)
-        promptUndoStack = (promptUndoStack + promptFieldValue.text).takeLast(HISTORY_LIMIT)
-        promptHistoryAt = 0L
-        updatePromptField(
-            TextFieldValue(next, TextRange(next.length)),
-            recordHistory = false,
-        )
-    }
-
-    fun undoNegativePrompt() {
-        if (negativePromptUndoStack.isEmpty()) return
-        val previous = negativePromptUndoStack.last()
-        negativePromptUndoStack = negativePromptUndoStack.dropLast(1)
-        negativePromptRedoStack =
-            (negativePromptRedoStack + negativePromptFieldValue.text).takeLast(HISTORY_LIMIT)
-        negativePromptHistoryAt = 0L
-        updateNegativePromptField(
-            TextFieldValue(previous, TextRange(previous.length)),
-            recordHistory = false,
-        )
-    }
-
-    fun redoNegativePrompt() {
-        if (negativePromptRedoStack.isEmpty()) return
-        val next = negativePromptRedoStack.last()
-        negativePromptRedoStack = negativePromptRedoStack.dropLast(1)
-        negativePromptUndoStack =
-            (negativePromptUndoStack + negativePromptFieldValue.text).takeLast(HISTORY_LIMIT)
-        negativePromptHistoryAt = 0L
-        updateNegativePromptField(
-            TextFieldValue(next, TextRange(next.length)),
-            recordHistory = false,
-        )
-    }
+    PromptTokenCountEffect(promptField, backendReady = !isCheckingBackend)
+    PromptTokenCountEffect(negativePromptField, backendReady = !isCheckingBackend)
 
     val onBatchCountsChange = remember {
         { value: Float ->
@@ -1133,14 +687,9 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                 val needsPad =
                     scaled.width != currentWidth || scaled.height != currentHeight
                 val payload = if (needsPad) {
-                    val padded = padBitmapToCanvas(scaled, currentWidth, currentHeight)
-                    val baos = ByteArrayOutputStream()
-                    padded.compress(Bitmap.CompressFormat.PNG, 90, baos)
-                    Base64.getEncoder().encodeToString(baos.toByteArray())
+                    bitmapToBase64Png(padBitmapToCanvas(scaled, currentWidth, currentHeight))
                 } else {
-                    val baos = ByteArrayOutputStream()
-                    scaled.compress(Bitmap.CompressFormat.PNG, 90, baos)
-                    Base64.getEncoder().encodeToString(baos.toByteArray())
+                    bitmapToBase64Png(scaled)
                 }
 
                 withContext(Dispatchers.Main) {
@@ -1177,10 +726,7 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                 // padded image upload.
                 val needsPad = maskBmp.width != currentWidth || maskBmp.height != currentHeight
                 val payload = if (needsPad) {
-                    val padded = padBitmapToCanvas(maskBmp, currentWidth, currentHeight)
-                    val baos = ByteArrayOutputStream()
-                    padded.compress(Bitmap.CompressFormat.PNG, 90, baos)
-                    Base64.getEncoder().encodeToString(baos.toByteArray())
+                    bitmapToBase64Png(padBitmapToCanvas(maskBmp, currentWidth, currentHeight))
                 } else {
                     maskBase64
                 }
@@ -1244,9 +790,7 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                     }
 
                 val base64String = withContext(Dispatchers.IO) {
-                    val baos = ByteArrayOutputStream()
-                    uploadBitmap.compress(Bitmap.CompressFormat.PNG, 90, baos)
-                    Base64.getEncoder().encodeToString(baos.toByteArray())
+                    bitmapToBase64Png(uploadBitmap)
                 }
 
                 withContext(Dispatchers.IO) {
@@ -1451,7 +995,9 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
     LaunchedEffect(modelId, model?.runOnCpu) {
         if (model?.runOnCpu == false && model.isSdxl == false) {
             val baseResolution = Resolution(512, 512)
-            val patchResolutions = PatchScanner.scanAvailableResolutions(context, modelId)
+            val patchResolutions = withContext(Dispatchers.IO) {
+                PatchScanner.scanAvailableResolutions(context, modelId)
+            }
 
             val allResolutions =
                 (listOf(baseResolution) + patchResolutions).distinctBy { "${it.width}x${it.height}" }
@@ -1459,22 +1005,16 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
         }
     }
 
-    LaunchedEffect(modelId) {
-        if (!hasInitialized) {
+    LaunchedEffect(modelId, model) {
+        if (!hasInitialized && model != null) {
             val prefs = generationPreferences.getPreferences(modelId).first()
             val isFirstRun = !prefs.hasSaved
-            val defaults = model?.defaults ?: GenerationDefaults.GLOBAL
+            val defaults = model.defaults
 
-            if (isFirstRun) {
-                prompt = defaults.prompt
-                negativePrompt = defaults.negativePrompt
-            } else {
-                prompt = prefs.prompt
-                negativePrompt = prefs.negativePrompt
-            }
-            promptFieldValue = TextFieldValue(prompt, TextRange(prompt.length))
-            negativePromptFieldValue =
-                TextFieldValue(negativePrompt, TextRange(negativePrompt.length))
+            promptField.replaceText(if (isFirstRun) defaults.prompt else prefs.prompt)
+            negativePromptField.replaceText(
+                if (isFirstRun) defaults.negativePrompt else prefs.negativePrompt,
+            )
 
             steps = if (isFirstRun) defaults.steps else prefs.steps
             cfg = if (isFirstRun) defaults.cfg else prefs.cfg
@@ -1487,24 +1027,18 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
             // non-1:1 ratio would silently fall back to 1024x1024 anyway.
             aspectRatio = if (useImg2img) prefs.aspectRatio else "1:1"
 
-            currentWidth =
-                if (model?.isSdxl == true) {
-                    1024
-                } else if (prefs.width == -1) {
-                    (if (model?.runOnCpu == true) 256 else 512)
-                } else {
-                    prefs.width
-                }
-            currentHeight =
-                if (model?.isSdxl == true) {
-                    1024
-                } else if (prefs.height == -1) {
-                    (if (model?.runOnCpu == true) 256 else 512)
-                } else {
-                    prefs.height
-                }
+            currentWidth = when {
+                model.isSdxl -> 1024
+                prefs.width == -1 -> defaultGenerationSize(isSdxl = false, runOnCpu = model.runOnCpu)
+                else -> prefs.width
+            }
+            currentHeight = when {
+                model.isSdxl -> 1024
+                prefs.height == -1 -> defaultGenerationSize(isSdxl = false, runOnCpu = model.runOnCpu)
+                else -> prefs.height
+            }
 
-            if (isFirstRun && model != null) {
+            if (isFirstRun) {
                 saveAllFields()
             }
 
@@ -1516,17 +1050,12 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
         if (hasInitialized && backendState !is BackendService.BackendState.Running) {
             val intent = Intent(context, BackendService::class.java).apply {
                 putExtra("modelId", model?.id)
+                putExtra("backendType", model?.backendType)
                 putExtra("width", currentWidth)
                 putExtra("height", currentHeight)
                 putExtra("use_opencl", useOpenCL)
             }
             context.startForegroundService(intent)
-        }
-    }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            cleanup()
         }
     }
 
@@ -1680,277 +1209,141 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
     }
 
     if (showExitDialog) {
-        AlertDialog(
-            onDismissRequest = { showExitDialog = false },
-            title = { Text(stringResource(R.string.confirm_exit)) },
-            text = { Text(stringResource(R.string.confirm_exit_hint)) },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showExitDialog = false
-                        handleExit()
-                    },
-                ) {
-                    Text(stringResource(R.string.confirm))
-                }
+        ModelRunConfirmDialog(
+            title = stringResource(R.string.confirm_exit),
+            text = stringResource(R.string.confirm_exit_hint),
+            onConfirm = {
+                showExitDialog = false
+                handleExit()
             },
-            dismissButton = {
-                TextButton(onClick = { showExitDialog = false }) {
-                    Text(stringResource(R.string.cancel))
-                }
-            },
+            onDismiss = { showExitDialog = false },
         )
     }
     if (showOpenCLWarningDialog) {
-        AlertDialog(
-            onDismissRequest = { showOpenCLWarningDialog = false },
-            title = { Text("GPU Runtime Warning") },
-            text = { Text(stringResource(R.string.opencl_warning)) },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showOpenCLWarningDialog = false
-                        useOpenCL = true
-                        saveAllFields()
-                    },
-                ) {
-                    Text(stringResource(R.string.confirm))
-                }
+        ModelRunConfirmDialog(
+            title = "GPU Runtime Warning",
+            text = stringResource(R.string.opencl_warning),
+            onConfirm = {
+                showOpenCLWarningDialog = false
+                useOpenCL = true
+                saveAllFields()
             },
-            dismissButton = {
-                TextButton(onClick = { showOpenCLWarningDialog = false }) {
-                    Text(stringResource(R.string.cancel))
-                }
-            },
+            onDismiss = { showOpenCLWarningDialog = false },
         )
     }
 
     if (showCustomAspectRatioDialog) {
-        var ratioWStr by remember { mutableStateOf("") }
-        var ratioHStr by remember { mutableStateOf("") }
-        var ratioError by remember { mutableStateOf(false) }
-        AlertDialog(
-            onDismissRequest = { showCustomAspectRatioDialog = false },
-            title = { Text(stringResource(R.string.aspect_ratio_custom_title)) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        stringResource(R.string.aspect_ratio_custom_hint),
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        OutlinedTextField(
-                            value = ratioWStr,
-                            onValueChange = {
-                                ratioWStr = it.filter { c -> c.isDigit() }.take(5)
-                                ratioError =
-                                    false
-                            },
-                            label = { Text("W") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                            modifier = Modifier.weight(1f),
-                            shape = MaterialTheme.shapes.medium,
-                            isError = ratioError,
-                        )
-                        Text(":", style = MaterialTheme.typography.titleLarge)
-                        OutlinedTextField(
-                            value = ratioHStr,
-                            onValueChange = {
-                                ratioHStr = it.filter { c -> c.isDigit() }.take(5)
-                                ratioError =
-                                    false
-                            },
-                            label = { Text("H") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                            modifier = Modifier.weight(1f),
-                            shape = MaterialTheme.shapes.medium,
-                            isError = ratioError,
-                        )
-                    }
-                    if (ratioError) {
-                        Text(
-                            stringResource(R.string.aspect_ratio_invalid),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error,
-                        )
-                    }
+        CustomAspectRatioDialog(
+            onConfirm = { newRatio ->
+                if (newRatio != aspectRatio) {
+                    aspectRatio = newRatio
+                    clearImg2imgState()
+                    saveAllFields()
                 }
+                showCustomAspectRatioDialog = false
             },
-            confirmButton = {
-                TextButton(onClick = {
-                    val w = ratioWStr.toIntOrNull()
-                    val h = ratioHStr.toIntOrNull()
-                    if (w != null && h != null && w > 0 && h > 0) {
-                        val newRatio = "$w:$h"
-                        if (newRatio != aspectRatio) {
-                            aspectRatio = newRatio
-                            clearImg2imgState()
-                            saveAllFields()
-                        }
-                        showCustomAspectRatioDialog = false
-                    } else {
-                        ratioError = true
-                    }
-                }) { Text(stringResource(R.string.confirm)) }
-            },
-            dismissButton = {
-                TextButton(onClick = { showCustomAspectRatioDialog = false }) {
-                    Text(stringResource(R.string.cancel))
-                }
-            },
+            onDismiss = { showCustomAspectRatioDialog = false },
         )
     }
 
     if (showResolutionChangeDialog && pendingResolution != null) {
-        AlertDialog(
-            onDismissRequest = {
+        ModelRunConfirmDialog(
+            title = stringResource(R.string.switch_resolution),
+            text = stringResource(R.string.switch_resolution_hint),
+            onConfirm = {
+                pendingResolution?.let { resolution ->
+                    // Check aspect ratio change
+                    val oldRatio =
+                        if (currentHeight > 0) currentWidth.toFloat() / currentHeight.toFloat() else 1f
+                    val newRatio =
+                        if (resolution.height >
+                            0
+                        ) {
+                            resolution.width.toFloat() / resolution.height.toFloat()
+                        } else {
+                            1f
+                        }
+
+                    if (kotlin.math.abs(oldRatio - newRatio) > 0.01f) {
+                        clearImg2imgState()
+                    }
+
+                    currentWidth = resolution.width
+                    currentHeight = resolution.height
+                    scope.launch {
+                        generationPreferences.saveResolution(
+                            modelId,
+                            resolution.width,
+                            resolution.height,
+                        )
+                    }
+                    model?.let { m ->
+                        val serviceIntent =
+                            Intent(context, BackendService::class.java).apply {
+                                action = BackendService.ACTION_RESTART
+                                putExtra("modelId", modelId)
+                                putExtra("backendType", m.backendType)
+                                putExtra("width", resolution.width)
+                                putExtra("height", resolution.height)
+                            }
+                        context.startForegroundService(serviceIntent)
+                        isCheckingBackend = true
+                        backendRestartTrigger++
+                    }
+                }
                 showResolutionChangeDialog = false
                 pendingResolution = null
+                showAdvancedSettings = false
             },
-            title = { Text(stringResource(R.string.switch_resolution)) },
-            text = { Text(stringResource(R.string.switch_resolution_hint)) },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        pendingResolution?.let { resolution ->
-                            // Check aspect ratio change
-                            val oldRatio =
-                                if (currentHeight > 0) currentWidth.toFloat() / currentHeight.toFloat() else 1f
-                            val newRatio =
-                                if (resolution.height >
-                                    0
-                                ) {
-                                    resolution.width.toFloat() / resolution.height.toFloat()
-                                } else {
-                                    1f
-                                }
-
-                            if (kotlin.math.abs(oldRatio - newRatio) > 0.01f) {
-                                // Clear img2img data
-                                selectedImageUri = null
-                                croppedBitmap = null
-                                maskBitmap = null
-                                isInpaintMode = false
-                                cropRect = null
-                                savedPathHistory = null
-                                base64EncodeDone = false
-                                hasOriginalImageForStitch = false
-                            }
-
-                            currentWidth = resolution.width
-                            currentHeight = resolution.height
-                            scope.launch {
-                                generationPreferences.saveResolution(
-                                    modelId,
-                                    resolution.width,
-                                    resolution.height,
-                                )
-                            }
-                            model?.let { m ->
-                                val serviceIntent =
-                                    Intent(context, BackendService::class.java).apply {
-                                        action = BackendService.ACTION_RESTART
-                                        putExtra("modelId", modelId)
-                                        putExtra("width", resolution.width)
-                                        putExtra("height", resolution.height)
-                                    }
-                                context.startForegroundService(serviceIntent)
-                                isCheckingBackend = true
-                                backendRestartTrigger++
-                            }
-                        }
-                        showResolutionChangeDialog = false
-                        pendingResolution = null
-                        showAdvancedSettings = false
-                    },
-                ) {
-                    Text(stringResource(R.string.confirm))
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = {
-                        showResolutionChangeDialog = false
-                        pendingResolution = null
-                    },
-                ) {
-                    Text(stringResource(R.string.cancel))
-                }
+            onDismiss = {
+                showResolutionChangeDialog = false
+                pendingResolution = null
             },
         )
     }
 
     if (showResetConfirmDialog) {
-        AlertDialog(
-            onDismissRequest = { showResetConfirmDialog = false },
-            title = { Text(stringResource(R.string.reset)) },
-            text = { Text(stringResource(R.string.reset_hint)) },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        val defaults = model?.defaults ?: GenerationDefaults.GLOBAL
-                        steps = defaults.steps
-                        cfg = defaults.cfg
-                        seed = defaults.seed
-                        batchCounts = defaults.batchCounts
-                        scheduler = defaults.scheduler
-                        aspectRatio = defaults.aspectRatio
-                        prompt = defaults.prompt
-                        negativePrompt = defaults.negativePrompt
-                        promptFieldValue = TextFieldValue(prompt, TextRange(prompt.length))
-                        negativePromptFieldValue =
-                            TextFieldValue(negativePrompt, TextRange(negativePrompt.length))
-                        promptSuggestions = emptyList()
-                        negativePromptSuggestions = emptyList()
-                        denoiseStrength = defaults.denoiseStrength
-                        scope.launch(Dispatchers.IO) {
-                            generationPreferences.saveAllFields(
-                                modelId = modelId,
-                                prompt = defaults.prompt,
-                                negativePrompt = defaults.negativePrompt,
-                                steps = defaults.steps,
-                                cfg = defaults.cfg,
-                                seed = defaults.seed,
-                                width = if (model?.isSdxl == true) {
-                                    1024
-                                } else if (model?.runOnCpu == true) {
-                                    256
-                                } else {
-                                    512
-                                },
-                                height = if (model?.isSdxl == true) {
-                                    1024
-                                } else if (model?.runOnCpu == true) {
-                                    256
-                                } else {
-                                    512
-                                },
-                                denoiseStrength = defaults.denoiseStrength,
-                                useOpenCL = useOpenCL,
-                                batchCounts = defaults.batchCounts,
-                                scheduler = defaults.scheduler,
-                                aspectRatio = defaults.aspectRatio,
-                            )
-                        }
-                        showResetConfirmDialog = false
-                    },
-                    colors = ButtonDefaults.textButtonColors(
-                        contentColor = MaterialTheme.colorScheme.error,
-                    ),
-                ) {
-                    Text(stringResource(R.string.confirm))
+        ModelRunConfirmDialog(
+            title = stringResource(R.string.reset),
+            text = stringResource(R.string.reset_hint),
+            destructiveConfirm = true,
+            onConfirm = {
+                val defaults = model?.defaults ?: GenerationDefaults.GLOBAL
+                steps = defaults.steps
+                cfg = defaults.cfg
+                seed = defaults.seed
+                batchCounts = defaults.batchCounts
+                scheduler = defaults.scheduler
+                aspectRatio = defaults.aspectRatio
+                promptField.replaceText(defaults.prompt)
+                negativePromptField.replaceText(defaults.negativePrompt)
+                denoiseStrength = defaults.denoiseStrength
+                scope.launch(Dispatchers.IO) {
+                    generationPreferences.saveAllFields(
+                        modelId = modelId,
+                        prompt = defaults.prompt,
+                        negativePrompt = defaults.negativePrompt,
+                        steps = defaults.steps,
+                        cfg = defaults.cfg,
+                        seed = defaults.seed,
+                        width = defaultGenerationSize(
+                            model?.isSdxl == true,
+                            model?.runOnCpu == true,
+                        ),
+                        height = defaultGenerationSize(
+                            model?.isSdxl == true,
+                            model?.runOnCpu == true,
+                        ),
+                        denoiseStrength = defaults.denoiseStrength,
+                        useOpenCL = useOpenCL,
+                        batchCounts = defaults.batchCounts,
+                        scheduler = defaults.scheduler,
+                        aspectRatio = defaults.aspectRatio,
+                    )
                 }
+                showResetConfirmDialog = false
             },
-            dismissButton = {
-                TextButton(onClick = { showResetConfirmDialog = false }) {
-                    Text(stringResource(R.string.cancel))
-                }
-            },
+            onDismiss = { showResetConfirmDialog = false },
         )
     }
 
@@ -2063,610 +1456,141 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                                 }
                             }
                             if (showAdvancedSettings) {
-                                AlertDialog(
-                                    onDismissRequest = {
-                                        showAdvancedSettings = false
-                                    },
-                                    title = {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                        ) {
-                                            Text(
-                                                stringResource(R.string.advanced_settings_title),
-                                                modifier = Modifier.weight(1f),
-                                            )
-                                            IconButton(onClick = {
-                                                val clipboard =
-                                                    context.getSystemService(
-                                                        Context.CLIPBOARD_SERVICE,
-                                                    ) as? ClipboardManager
-                                                val raw = clipboard?.primaryClip
-                                                    ?.takeIf { it.itemCount > 0 }
-                                                    ?.getItemAt(0)
-                                                    ?.coerceToText(context)
-                                                    ?.toString()
-                                                val imported = ParamShare.tryDecode(raw)
-                                                if (imported != null) {
-                                                    pendingImport = imported
-                                                    clipboardImportChecked = true
-                                                } else {
-                                                    Toast.makeText(
-                                                        context,
-                                                        msgImportNoParams,
-                                                        Toast.LENGTH_SHORT,
-                                                    ).show()
-                                                }
-                                            }) {
-                                                Icon(
-                                                    imageVector = Icons.Default.ContentPaste,
-                                                    contentDescription = stringResource(R.string.import_from_clipboard),
-                                                )
-                                            }
-                                            IconButton(onClick = {
-                                                val currentMode = when {
-                                                    isInpaintMode -> GenerationMode.INPAINT
-                                                    selectedImageUri != null -> GenerationMode.IMG2IMG
-                                                    else -> GenerationMode.TXT2IMG
-                                                }
-                                                shareSourceParams = GenerationParameters(
-                                                    steps = steps.toInt(),
-                                                    cfg = cfg,
-                                                    seed = seed.toLongOrNull(),
-                                                    prompt = prompt,
-                                                    negativePrompt = negativePrompt,
-                                                    generationTime = null,
-                                                    width = currentWidth,
-                                                    height = currentHeight,
-                                                    runOnCpu = model?.runOnCpu ?: false,
-                                                    denoiseStrength = denoiseStrength,
-                                                    useOpenCL = useOpenCL,
-                                                    scheduler = scheduler,
-                                                    mode = currentMode,
-                                                )
-                                                shareSourceModelId = modelId
-                                            }) {
-                                                Icon(
-                                                    imageVector = Icons.Default.Share,
-                                                    contentDescription = stringResource(R.string.share),
-                                                )
-                                            }
+                                AdvancedSettingsDialog(
+                                    isSdxl = model?.isSdxl == true,
+                                    runOnCpu = model?.runOnCpu ?: false,
+                                    useImg2img = useImg2img,
+                                    isRunning = isRunning,
+                                    aspectRatio = aspectRatio,
+                                    availableResolutions = availableResolutions,
+                                    currentWidth = currentWidth,
+                                    currentHeight = currentHeight,
+                                    scheduler = scheduler,
+                                    steps = steps,
+                                    cfg = cfg,
+                                    useOpenCL = useOpenCL,
+                                    batchCounts = batchCounts,
+                                    denoiseStrength = denoiseStrength,
+                                    seed = seed,
+                                    returnedSeed = returnedSeed,
+                                    onAspectRatioSelected = { ratio ->
+                                        if (!isRunning && aspectRatio != ratio) {
+                                            aspectRatio = ratio
+                                            clearImg2imgState()
+                                            saveAllFields()
                                         }
                                     },
-                                    text = {
-                                        Column(
-                                            verticalArrangement = Arrangement.spacedBy(
-                                                2.dp,
-                                            ),
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .verticalScroll(rememberScrollState())
-                                                .padding(vertical = 4.dp),
-                                        ) {
-                                            // Aspect ratio needs the VAE encoder (inpaint-based
-                                            // padding), which --no_img2img does not load.
-                                            if (model?.isSdxl == true && useImg2img) {
-                                                Column(modifier = Modifier.fillMaxWidth()) {
-                                                    Text(
-                                                        stringResource(R.string.aspect_ratio),
-                                                        style = MaterialTheme.typography.bodyMedium,
-                                                    )
-                                                    val presets = listOf("1:1", "3:4", "4:3")
-                                                    val isCustom = aspectRatio !in presets
-                                                    Row(
-                                                        modifier = Modifier
-                                                            .fillMaxWidth()
-                                                            .horizontalScroll(rememberScrollState()),
-                                                        horizontalArrangement = Arrangement.spacedBy(
-                                                            ButtonGroupDefaults.ConnectedSpaceBetween,
-                                                        ),
-                                                    ) {
-                                                        presets.forEachIndexed { index, ratio ->
-                                                            val shapes = if (index == 0) {
-                                                                ButtonGroupDefaults.connectedLeadingButtonShapes()
-                                                            } else {
-                                                                ButtonGroupDefaults.connectedMiddleButtonShapes()
-                                                            }
-                                                            ToggleButton(
-                                                                checked = aspectRatio == ratio,
-                                                                onCheckedChange = { checked ->
-                                                                    if (checked && !isRunning && aspectRatio != ratio) {
-                                                                        aspectRatio = ratio
-                                                                        clearImg2imgState()
-                                                                        saveAllFields()
-                                                                    }
-                                                                },
-                                                                shapes = shapes,
-                                                                enabled = !isRunning,
-                                                            ) {
-                                                                Text(ratio)
-                                                            }
-                                                        }
-                                                        ToggleButton(
-                                                            checked = isCustom,
-                                                            onCheckedChange = {
-                                                                if (!isRunning) {
-                                                                    showCustomAspectRatioDialog = true
-                                                                }
-                                                            },
-                                                            shapes = ButtonGroupDefaults.connectedTrailingButtonShapes(),
-                                                            enabled = !isRunning,
-                                                        ) {
-                                                            Text(
-                                                                if (isCustom) {
-                                                                    aspectRatio
-                                                                } else {
-                                                                    stringResource(R.string.aspect_ratio_custom)
-                                                                },
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if (model?.runOnCpu == false &&
-                                                model.isSdxl == false &&
-                                                availableResolutions.isNotEmpty()
-                                            ) {
-                                                Column(
-                                                    modifier = Modifier.fillMaxWidth(),
-                                                    // verticalArrangement = Arrangement.spacedBy(
-                                                    //     4.dp
-                                                    // )
-                                                ) {
-                                                    Text(
-                                                        stringResource(R.string.resolution),
-                                                        style = MaterialTheme.typography.bodyMedium,
-                                                    )
-                                                    Row(
-                                                        modifier = Modifier
-                                                            .fillMaxWidth()
-                                                            .horizontalScroll(
-                                                                rememberScrollState(),
-                                                            ),
-                                                        horizontalArrangement = Arrangement.spacedBy(
-                                                            ButtonGroupDefaults.ConnectedSpaceBetween,
-                                                        ),
-                                                    ) {
-                                                        availableResolutions.forEachIndexed { index, resolution ->
-                                                            val shapes = when (index) {
-                                                                0 -> ButtonGroupDefaults.connectedLeadingButtonShapes()
-
-                                                                availableResolutions.lastIndex ->
-                                                                    ButtonGroupDefaults.connectedTrailingButtonShapes()
-
-                                                                else -> ButtonGroupDefaults.connectedMiddleButtonShapes()
-                                                            }
-                                                            ToggleButton(
-                                                                checked = currentWidth == resolution.width &&
-                                                                    currentHeight == resolution.height,
-                                                                onCheckedChange = { checked ->
-                                                                    if (checked &&
-                                                                        !isRunning &&
-                                                                        (
-                                                                            resolution.width != currentWidth ||
-                                                                                resolution.height != currentHeight
-                                                                            )
-                                                                    ) {
-                                                                        pendingResolution = resolution
-                                                                        showResolutionChangeDialog = true
-                                                                    }
-                                                                },
-                                                                shapes = shapes,
-                                                                enabled = !isRunning,
-                                                            ) {
-                                                                Text(resolution.toString())
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            Column(
-                                                modifier = Modifier.fillMaxWidth(),
-                                                // verticalArrangement = Arrangement.spacedBy(4.dp)
-                                            ) {
-                                                // Split scheduler id into base + Karras flag so the UI
-                                                // can offer one base chip per family plus a single
-                                                // Karras switch, instead of listing every combination.
-                                                val baseId = scheduler.removeSuffix("_karras")
-                                                val karras = scheduler.endsWith("_karras")
-                                                val karrasSupported = baseId != "lcm"
-                                                val baseOptions = listOf(
-                                                    "dpm" to "DPM++ 2M",
-                                                    "dpm_sde" to "DPM++ 2M SDE",
-                                                    "euler_a" to "Euler A",
-                                                    "euler" to "Euler",
-                                                    "lcm" to "LCM",
-                                                )
-                                                Row(
-                                                    modifier = Modifier.fillMaxWidth(),
-                                                    verticalAlignment = Alignment.CenterVertically,
-                                                ) {
-                                                    Text(
-                                                        stringResource(R.string.scheduler),
-                                                        style = MaterialTheme.typography.bodyMedium,
-                                                        modifier = Modifier.weight(1f),
-                                                    )
-                                                    Text(
-                                                        "Karras",
-                                                        style = MaterialTheme.typography.bodyMedium,
-                                                        modifier = Modifier
-                                                            .padding(end = 8.dp)
-                                                            .alpha(if (karrasSupported) 1f else 0.4f),
-                                                    )
-                                                    CompositionLocalProvider(
-                                                        LocalMinimumInteractiveComponentSize provides Dp.Unspecified,
-                                                    ) {
-                                                        Switch(
-                                                            checked = karras && karrasSupported,
-                                                            enabled = karrasSupported,
-                                                            onCheckedChange = { enable ->
-                                                                scheduler = if (enable) {
-                                                                    "${baseId}_karras"
-                                                                } else {
-                                                                    baseId
-                                                                }
-                                                                saveAllFields()
-                                                            },
-                                                            modifier = Modifier.scale(0.8f),
-                                                        )
-                                                    }
-                                                }
-                                                Row(
-                                                    modifier = Modifier
-                                                        .fillMaxWidth()
-                                                        .horizontalScroll(rememberScrollState()),
-                                                    horizontalArrangement = Arrangement.spacedBy(
-                                                        ButtonGroupDefaults.ConnectedSpaceBetween,
-                                                    ),
-                                                ) {
-                                                    baseOptions.forEachIndexed { index, (id, label) ->
-                                                        val shapes = when (index) {
-                                                            0 -> ButtonGroupDefaults.connectedLeadingButtonShapes()
-
-                                                            baseOptions.lastIndex ->
-                                                                ButtonGroupDefaults.connectedTrailingButtonShapes()
-
-                                                            else -> ButtonGroupDefaults.connectedMiddleButtonShapes()
-                                                        }
-                                                        ToggleButton(
-                                                            checked = baseId == id,
-                                                            onCheckedChange = { checked ->
-                                                                if (checked) {
-                                                                    val nextKarras =
-                                                                        karras && id != "lcm"
-                                                                    scheduler = if (nextKarras) {
-                                                                        "${id}_karras"
-                                                                    } else {
-                                                                        id
-                                                                    }
-                                                                    saveAllFields()
-                                                                }
-                                                            },
-                                                            shapes = shapes,
-                                                        ) {
-                                                            Text(label)
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            Column {
-                                                Text(
-                                                    stringResource(
-                                                        R.string.steps,
-                                                        steps.roundToInt(),
-                                                    ),
-                                                    style = MaterialTheme.typography.bodyMedium,
-                                                )
-                                                Slider(
-                                                    value = steps,
-                                                    onValueChange = onStepsChange,
-                                                    valueRange = 1f..50f,
-                                                    steps = 48,
-                                                    modifier = Modifier.fillMaxWidth(),
-                                                )
-                                            }
-
-                                            Column {
-                                                Text(
-                                                    "CFG Scale: %.1f".format(cfg),
-                                                    style = MaterialTheme.typography.bodyMedium,
-                                                )
-                                                Slider(
-                                                    value = cfg,
-                                                    onValueChange = onCfgChange,
-                                                    valueRange = 1f..30f,
-                                                    steps = 57,
-                                                    modifier = Modifier.fillMaxWidth(),
-                                                )
-                                            }
-                                            if (model?.runOnCpu ?: false) {
-                                                Column {
-                                                    Text(
-                                                        stringResource(
-                                                            R.string.image_size,
-                                                            currentWidth,
-                                                            currentHeight,
-                                                        ),
-                                                        style = MaterialTheme.typography.bodyMedium,
-                                                    )
-                                                    Slider(
-                                                        value = currentWidth.toFloat(),
-                                                        onValueChange = onSizeChange,
-                                                        valueRange = 128f..512f,
-                                                        steps = 5,
-                                                        modifier = Modifier.fillMaxWidth(),
-                                                    )
-                                                }
-                                            }
-                                            if (model?.runOnCpu ?: false) {
-                                                Row(
-                                                    modifier = Modifier.fillMaxWidth(),
-                                                    verticalAlignment = Alignment.CenterVertically,
-                                                    horizontalArrangement = Arrangement.spacedBy(
-                                                        ButtonGroupDefaults.ConnectedSpaceBetween,
-                                                    ),
-                                                ) {
-                                                    Text(
-                                                        "Runtime",
-                                                        style = MaterialTheme.typography.bodyMedium,
-                                                        modifier = Modifier.padding(end = 4.dp),
-                                                    )
-                                                    ToggleButton(
-                                                        checked = !useOpenCL,
-                                                        onCheckedChange = { checked ->
-                                                            if (checked) {
-                                                                useOpenCL = false
-                                                                saveAllFields()
-                                                            }
-                                                        },
-                                                        shapes = ButtonGroupDefaults.connectedLeadingButtonShapes(),
-                                                        modifier = Modifier.weight(1f),
-                                                    ) {
-                                                        Text("CPU")
-                                                    }
-                                                    ToggleButton(
-                                                        checked = useOpenCL,
-                                                        onCheckedChange = { checked ->
-                                                            if (checked) {
-                                                                showOpenCLWarningDialog = true
-                                                            }
-                                                        },
-                                                        shapes = ButtonGroupDefaults.connectedTrailingButtonShapes(),
-                                                        modifier = Modifier.weight(1f),
-                                                    ) {
-                                                        Text("GPU")
-                                                    }
-                                                }
-                                            }
-                                            Column {
-                                                Text(
-                                                    stringResource(
-                                                        R.string.batch_count,
-                                                        batchCounts,
-                                                    ),
-                                                    style = MaterialTheme.typography.bodyMedium,
-                                                )
-                                                Slider(
-                                                    value = batchCounts.toFloat(),
-                                                    onValueChange = onBatchCountsChange,
-                                                    valueRange = 1f..10f,
-                                                    steps = 8,
-                                                    modifier = Modifier.fillMaxWidth(),
-                                                )
-                                            }
-                                            if (useImg2img) {
-                                                Column {
-                                                    Text(
-                                                        "[img2img]Denoise Strength: %.2f".format(
-                                                            denoiseStrength,
-                                                        ),
-                                                        style = MaterialTheme.typography.bodyMedium,
-                                                    )
-                                                    Slider(
-                                                        value = denoiseStrength,
-                                                        onValueChange = onDenoiseStrengthChange,
-                                                        valueRange = 0f..1f,
-                                                        steps = 99,
-                                                        modifier = Modifier.fillMaxWidth(),
-                                                    )
-                                                }
-                                            }
-                                            Column(
-                                                modifier = Modifier.fillMaxWidth(),
-                                                verticalArrangement = Arrangement.spacedBy(
-                                                    8.dp,
-                                                ),
-                                            ) {
-                                                OutlinedTextField(
-                                                    value = seed,
-                                                    onValueChange = onSeedChange,
-                                                    label = { Text(stringResource(R.string.random_seed)) },
-                                                    keyboardOptions = KeyboardOptions(
-                                                        keyboardType = KeyboardType.Number,
-                                                    ),
-                                                    modifier = Modifier.fillMaxWidth(),
-                                                    shape = MaterialTheme.shapes.medium,
-                                                    trailingIcon = {
-                                                        if (seed.isNotEmpty()) {
-                                                            IconButton(onClick = {
-                                                                seed = ""
-                                                                saveAllFields()
-                                                            }) {
-                                                                Icon(
-                                                                    Icons.Default.Clear,
-                                                                    contentDescription = "clear",
-                                                                )
-                                                            }
-                                                        }
-                                                    },
-                                                )
-
-                                                if (returnedSeed != null) {
-                                                    FilledTonalButton(
-                                                        onClick = {
-                                                            seed =
-                                                                returnedSeed.toString()
-                                                            saveAllFields()
-                                                        },
-                                                        modifier = Modifier.fillMaxWidth(),
-                                                    ) {
-                                                        Icon(
-                                                            Icons.Default.Refresh,
-                                                            contentDescription = stringResource(
-                                                                R.string.use_last_seed,
-                                                            ),
-                                                            modifier = Modifier
-                                                                .size(
-                                                                    20.dp,
-                                                                )
-                                                                .padding(end = 4.dp),
-                                                        )
-                                                        Text(
-                                                            stringResource(
-                                                                R.string.use_last_seed,
-                                                                returnedSeed.toString(),
-                                                            ),
-                                                        )
-                                                    }
-                                                }
-                                            }
+                                    onCustomAspectRatioClick = {
+                                        if (!isRunning) {
+                                            showCustomAspectRatioDialog = true
                                         }
                                     },
-                                    confirmButton = {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                        ) {
-                                            TextButton(
-                                                onClick = {
-                                                    showResetConfirmDialog = true
-                                                },
-                                                colors = ButtonDefaults.textButtonColors(
-                                                    contentColor = MaterialTheme.colorScheme.error,
-                                                ),
-                                            ) {
-                                                Icon(
-                                                    Icons.Default.Refresh,
-                                                    contentDescription = stringResource(
-                                                        R.string.reset,
-                                                    ),
-                                                    modifier = Modifier
-                                                        .size(20.dp)
-                                                        .padding(end = 4.dp),
+                                    onResolutionSelected = { resolution ->
+                                        if (!isRunning &&
+                                            (
+                                                resolution.width != currentWidth ||
+                                                    resolution.height != currentHeight
                                                 )
-                                                Text(stringResource(R.string.reset))
-                                            }
-
-                                            TextButton(onClick = {
-                                                showAdvancedSettings = false
-                                            }) {
-                                                Text(stringResource(R.string.confirm))
-                                            }
+                                        ) {
+                                            pendingResolution = resolution
+                                            showResolutionChangeDialog = true
                                         }
                                     },
+                                    onSchedulerChange = { value ->
+                                        scheduler = value
+                                        saveAllFields()
+                                    },
+                                    onStepsChange = onStepsChange,
+                                    onCfgChange = onCfgChange,
+                                    onSizeChange = onSizeChange,
+                                    onCpuSelected = {
+                                        useOpenCL = false
+                                        saveAllFields()
+                                    },
+                                    onGpuSelected = { showOpenCLWarningDialog = true },
+                                    onBatchCountsChange = onBatchCountsChange,
+                                    onDenoiseStrengthChange = onDenoiseStrengthChange,
+                                    onSeedChange = onSeedChange,
+                                    onUseLastSeed = {
+                                        seed = returnedSeed.toString()
+                                        saveAllFields()
+                                    },
+                                    onImportFromClipboard = {
+                                        val clipboard =
+                                            context.getSystemService(
+                                                Context.CLIPBOARD_SERVICE,
+                                            ) as? ClipboardManager
+                                        val raw = clipboard?.primaryClip
+                                            ?.takeIf { it.itemCount > 0 }
+                                            ?.getItemAt(0)
+                                            ?.coerceToText(context)
+                                            ?.toString()
+                                        val imported = ParamShare.tryDecode(raw)
+                                        if (imported != null) {
+                                            pendingImport = imported
+                                            clipboardImportChecked = true
+                                        } else {
+                                            Toast.makeText(
+                                                context,
+                                                msgImportNoParams,
+                                                Toast.LENGTH_SHORT,
+                                            ).show()
+                                        }
+                                    },
+                                    onShare = {
+                                        val currentMode = when {
+                                            isInpaintMode -> GenerationMode.INPAINT
+                                            selectedImageUri != null -> GenerationMode.IMG2IMG
+                                            else -> GenerationMode.TXT2IMG
+                                        }
+                                        shareSourceParams = GenerationParameters(
+                                            steps = steps.toInt(),
+                                            cfg = cfg,
+                                            seed = seed.toLongOrNull(),
+                                            prompt = promptField.text,
+                                            negativePrompt = negativePromptField.text,
+                                            generationTime = null,
+                                            width = currentWidth,
+                                            height = currentHeight,
+                                            runOnCpu = model?.runOnCpu ?: false,
+                                            denoiseStrength = denoiseStrength,
+                                            useOpenCL = useOpenCL,
+                                            scheduler = scheduler,
+                                            mode = currentMode,
+                                        )
+                                        shareSourceModelId = modelId
+                                    },
+                                    onReset = { showResetConfirmDialog = true },
+                                    onDismiss = { showAdvancedSettings = false },
                                 )
                             }
                         }
 
-                        PromptTagTextField(
-                            value = promptFieldValue,
-                            onValueChange = ::updatePromptField,
+                        ControlledPromptTagTextField(
+                            controller = promptField,
+                            autocompleteAvailable = tagAutocompleteAvailable,
                             modifier = Modifier.fillMaxWidth(),
                             label = {
                                 PromptCountLabel(
                                     label = stringResource(R.string.image_prompt),
-                                    count = promptTokenCount,
-                                    max = promptTokenMax,
-                                    showCount = prompt.isNotEmpty(),
+                                    count = promptField.tokenCount,
+                                    max = promptField.tokenMax,
+                                    showCount = promptField.text.isNotEmpty(),
                                 )
-                            },
-                            suggestions = promptSuggestions,
-                            onSuggestionClick = ::applyPromptSuggestion,
-                            showSuggestions = tagAutocompleteAvailable && isPromptFocused &&
-                                !promptPopupDismissed,
-                            // Toolbar stays up even on an empty prompt so undo/redo
-                            // remain reachable.
-                            showToolbar = tagAutocompleteAvailable && isPromptFocused &&
-                                !promptPopupDismissed,
-                            highlightQuery = promptActiveQuery,
-                            overflowOffset = promptOverflowOffset,
-                            onFocusChanged = {
-                                isPromptFocused = it
-                                if (!it) promptSuggestions = emptyList()
-                            },
-                            onDismissSuggestions = { promptPopupDismissed = true },
-                            onUndo = ::undoPrompt,
-                            onRedo = ::redoPrompt,
-                            undoEnabled = promptUndoStack.isNotEmpty(),
-                            redoEnabled = promptRedoStack.isNotEmpty(),
-                            onAddTag = {
-                                runPromptTagAction(TagAutocompleteRepository::appendTagAfterActive)
-                            },
-                            onClearTag = {
-                                runPromptTagAction(TagAutocompleteRepository::clearActiveTag)
-                            },
-                            onIncreaseWeight = {
-                                runPromptTagAction { text, sel ->
-                                    TagAutocompleteRepository.adjustActiveTagWeight(text, sel, 0.1)
-                                }
-                            },
-                            onDecreaseWeight = {
-                                runPromptTagAction { text, sel ->
-                                    TagAutocompleteRepository.adjustActiveTagWeight(text, sel, -0.1)
-                                }
                             },
                         )
 
-                        PromptTagTextField(
-                            value = negativePromptFieldValue,
-                            onValueChange = ::updateNegativePromptField,
+                        ControlledPromptTagTextField(
+                            controller = negativePromptField,
+                            autocompleteAvailable = tagAutocompleteAvailable,
                             modifier = Modifier.fillMaxWidth(),
                             label = {
                                 PromptCountLabel(
                                     label = stringResource(R.string.negative_prompt),
-                                    count = negativePromptTokenCount,
-                                    max = negativePromptTokenMax,
-                                    showCount = negativePrompt.isNotEmpty(),
+                                    count = negativePromptField.tokenCount,
+                                    max = negativePromptField.tokenMax,
+                                    showCount = negativePromptField.text.isNotEmpty(),
                                 )
-                            },
-                            suggestions = negativePromptSuggestions,
-                            onSuggestionClick = ::applyNegativePromptSuggestion,
-                            showSuggestions = tagAutocompleteAvailable && isNegativePromptFocused &&
-                                !negativePromptPopupDismissed,
-                            showToolbar = tagAutocompleteAvailable && isNegativePromptFocused &&
-                                !negativePromptPopupDismissed,
-                            highlightQuery = negativePromptActiveQuery,
-                            overflowOffset = negativePromptOverflowOffset,
-                            onFocusChanged = {
-                                isNegativePromptFocused = it
-                                if (!it) negativePromptSuggestions = emptyList()
-                            },
-                            onDismissSuggestions = { negativePromptPopupDismissed = true },
-                            onUndo = ::undoNegativePrompt,
-                            onRedo = ::redoNegativePrompt,
-                            undoEnabled = negativePromptUndoStack.isNotEmpty(),
-                            redoEnabled = negativePromptRedoStack.isNotEmpty(),
-                            onAddTag = {
-                                runNegativePromptTagAction(
-                                    TagAutocompleteRepository::appendTagAfterActive,
-                                )
-                            },
-                            onClearTag = {
-                                runNegativePromptTagAction(
-                                    TagAutocompleteRepository::clearActiveTag,
-                                )
-                            },
-                            onIncreaseWeight = {
-                                runNegativePromptTagAction { text, sel ->
-                                    TagAutocompleteRepository.adjustActiveTagWeight(text, sel, 0.1)
-                                }
-                            },
-                            onDecreaseWeight = {
-                                runNegativePromptTagAction { text, sel ->
-                                    TagAutocompleteRepository.adjustActiveTagWeight(text, sel, -0.1)
-                                }
                             },
                         )
 
@@ -2681,8 +1605,8 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                                     steps = steps.roundToInt(),
                                     cfg = cfg,
                                     seed = 0,
-                                    prompt = prompt,
-                                    negativePrompt = negativePrompt,
+                                    prompt = promptField.text,
+                                    negativePrompt = negativePromptField.text,
                                     generationTime = "",
                                     width = currentWidth,
                                     height = currentHeight,
@@ -2715,8 +1639,8 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                                             steps = steps.roundToInt(),
                                             cfg = cfg,
                                             seed = 0,
-                                            prompt = prompt,
-                                            negativePrompt = negativePrompt,
+                                            prompt = promptField.text,
+                                            negativePrompt = negativePromptField.text,
                                             generationTime = "",
                                             width = currentWidth,
                                             height = currentHeight,
@@ -2730,10 +1654,10 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                                             context,
                                             BackgroundGenerationService::class.java,
                                         ).apply {
-                                            putExtra("prompt", prompt)
+                                            putExtra("prompt", promptField.text)
                                             putExtra(
                                                 "negative_prompt",
-                                                negativePrompt,
+                                                negativePromptField.text,
                                             )
                                             putExtra("steps", steps.roundToInt())
                                             putExtra("cfg", cfg)
@@ -2788,16 +1712,15 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                                         // Wait for service to actually stop
                                         val waitStartTime =
                                             System.currentTimeMillis()
-                                        val timeoutMs = 5000L
-                                        while (BackgroundGenerationService.isServiceRunning.value) {
-                                            if (System.currentTimeMillis() - waitStartTime > timeoutMs) {
-                                                Log.w(
-                                                    "ModelRunScreen",
-                                                    "Timeout waiting for service to stop",
-                                                )
-                                                break
-                                            }
-                                            delay(100)
+                                        val stopped = withTimeoutOrNull(5000L) {
+                                            BackgroundGenerationService.isServiceRunning
+                                                .first { !it }
+                                        }
+                                        if (stopped == null) {
+                                            Log.w(
+                                                "ModelRunScreen",
+                                                "Timeout waiting for service to stop",
+                                            )
                                         }
 
                                         Log.d(
@@ -3104,694 +2027,6 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
         }
     }
 
-    @Composable
-    fun ResultPage() {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
-            Crossfade(
-                targetState = currentBitmap != null,
-                label = "result_crossfade",
-            ) { hasResult ->
-                if (!hasResult) {
-                    ElevatedCard(
-                        modifier = Modifier.padding(16.dp),
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .padding(24.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(12.dp),
-                        ) {
-                            val iconScale = remember { Animatable(1f) }
-                            LaunchedEffect(Unit) {
-                                iconScale.animateTo(
-                                    targetValue = 1.1f,
-                                    animationSpec = infiniteRepeatable(
-                                        animation = tween(1500),
-                                        repeatMode = RepeatMode.Reverse,
-                                    ),
-                                )
-                            }
-                            Icon(
-                                imageVector = Icons.Default.Image,
-                                contentDescription = null,
-                                modifier = Modifier
-                                    .size(48.dp)
-                                    .graphicsLayer(
-                                        scaleX = iconScale.value,
-                                        scaleY = iconScale.value,
-                                    ),
-                                tint = MaterialTheme.colorScheme.primary,
-                            )
-                            Text(
-                                stringResource(R.string.no_results),
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.onSurface,
-                            )
-                            Text(
-                                stringResource(R.string.no_results_hint),
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                            Button(
-                                onClick = {
-                                    coroutineScope.launch {
-                                        pagerState.animateScrollToPage(0)
-                                    }
-                                },
-                                modifier = Modifier.padding(top = 8.dp),
-                            ) {
-                                Text(stringResource(R.string.go_to_generate))
-                            }
-                        }
-                    }
-                } else {
-                    ElevatedCard(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = MaterialTheme.shapes.large,
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(16.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Text(
-                                    stringResource(R.string.result_tab),
-                                    style = MaterialTheme.typography.titleMedium,
-                                )
-                                currentBitmap?.let { bitmap ->
-                                    Row(
-                                        horizontalArrangement = Arrangement.spacedBy(
-                                            8.dp,
-                                        ),
-                                    ) {
-                                        if (BuildConfig.FLAVOR == "filter") {
-                                            FilledTonalIconButton(
-                                                onClick = {
-                                                    showReportDialog = true
-                                                },
-                                            ) {
-                                                Icon(
-                                                    imageVector = Icons.Default.Report,
-                                                    contentDescription = "report inappropriate content",
-                                                )
-                                            }
-                                        }
-
-                                        // Upscaler button - only show for NPU runtime and resolution <= 1024
-                                        if (!model?.runOnCpu!! &&
-                                            generationParams?.let {
-                                                maxOf(
-                                                    it.width,
-                                                    it.height,
-                                                ) <= 1024
-                                            } == true
-                                        ) {
-                                            FilledTonalIconButton(
-                                                onClick = {
-                                                    showUpscalerDialog = true
-                                                },
-                                                enabled = !isRunning && !isUpscaling,
-                                            ) {
-                                                Icon(
-                                                    imageVector = Icons.Default.AutoFixHigh,
-                                                    contentDescription = "upscale image",
-                                                )
-                                            }
-                                        }
-
-                                        FilledTonalIconButton(
-                                            onClick = {
-                                                handleSaveImage(
-                                                    context = context,
-                                                    bitmap = bitmap,
-                                                    onSuccess = {
-                                                        Toast.makeText(
-                                                            context,
-                                                            msgImageSaved,
-                                                            Toast.LENGTH_SHORT,
-                                                        ).show()
-                                                    },
-                                                    onError = { error ->
-                                                        Toast.makeText(
-                                                            context,
-                                                            error,
-                                                            Toast.LENGTH_SHORT,
-                                                        ).show()
-                                                    },
-                                                )
-                                            },
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Default.Save,
-                                                contentDescription = "save image",
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-
-                            // The shadowed Surface stays outside AnimatedContent: a
-                            // drop shadow rendered inside the crossfade's alpha layer
-                            // composites with a rectangular outline and flashes square
-                            // corners. Keeping it static lets only the image crossfade,
-                            // clipped to the rounded shape.
-                            Surface(
-                                onClick = { isPreviewMode = true },
-                                enabled = currentBitmap != null,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .aspectRatio(1f),
-                                shape = MaterialTheme.shapes.medium,
-                                shadowElevation = 4.dp,
-                            ) {
-                                AnimatedContent(
-                                    targetState = imageVersion to currentBitmap,
-                                    modifier = Modifier.fillMaxSize(),
-                                    transitionSpec = {
-                                        fadeIn(animationSpec = Motion.Fade) togetherWith
-                                            fadeOut(animationSpec = Motion.FadeOut)
-                                    },
-                                    label = "ImagePreviewCrossfade",
-                                ) { (_, bitmap) ->
-                                    bitmap?.let {
-                                        AsyncImage(
-                                            model = ImageRequest.Builder(
-                                                LocalContext.current,
-                                            )
-                                                .data(it)
-                                                .size(coil.size.Size.ORIGINAL)
-                                                .crossfade(true)
-                                                .build(),
-                                            contentDescription = "generated image",
-                                            modifier = Modifier.fillMaxSize(),
-                                        )
-                                    }
-                                }
-                            }
-
-                            if (historyItems.size > 1) {
-                                LazyRow(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(top = 8.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(
-                                        8.dp,
-                                    ),
-                                ) {
-                                    items(historyItems.take(20).size) { idx ->
-                                        val item = historyItems[idx]
-                                        Card(
-                                            onClick = {
-                                                val bitmap =
-                                                    BitmapFactory.decodeFile(
-                                                        item.imageFile.absolutePath,
-                                                    )
-                                                if (bitmap != null) {
-                                                    currentBitmap = bitmap
-                                                    generationParams = item.params
-                                                    generationParamsModelId = item.modelId
-                                                    currentDisplayedHistoryId = item.id
-                                                    imageVersion++
-                                                }
-                                            },
-                                            modifier = Modifier.size(72.dp),
-                                            shape = MaterialTheme.shapes.small,
-                                        ) {
-                                            AsyncImage(
-                                                model = ImageRequest.Builder(
-                                                    LocalContext.current,
-                                                )
-                                                    .data(item.imageFile)
-                                                    .crossfade(true)
-                                                    .build(),
-                                                contentDescription = "thumb",
-                                                modifier = Modifier.fillMaxSize(),
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-
-                            Card(
-                                onClick = { showParametersDialog = true },
-                                modifier = Modifier.fillMaxWidth(),
-                                colors = CardDefaults.cardColors(
-                                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                                ),
-                            ) {
-                                Column(
-                                    modifier = Modifier.padding(12.dp),
-                                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                                ) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically,
-                                    ) {
-                                        Text(
-                                            stringResource(R.string.generation_params),
-                                            style = MaterialTheme.typography.labelLarge,
-                                            color = MaterialTheme.colorScheme.onSurface,
-                                        )
-                                        Icon(
-                                            Icons.Default.Info,
-                                            contentDescription = "view details",
-                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        )
-                                    }
-
-                                    generationParams?.let { params ->
-                                        Text(
-                                            stringResource(
-                                                R.string.result_params,
-                                                params.steps,
-                                                params.cfg,
-                                                params.seed.toString(),
-                                            ),
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        )
-                                        Text(
-                                            stringResource(
-                                                R.string.result_params_2,
-                                                params.width,
-                                                params.height,
-                                                params.generationTime
-                                                    ?: "unknown",
-                                                if (params.runOnCpu) {
-                                                    if (params.useOpenCL) "GPU" else "CPU"
-                                                } else {
-                                                    "NPU"
-                                                },
-                                            ),
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if (showReportDialog && currentBitmap != null && generationParams != null) {
-                AlertDialog(
-                    onDismissRequest = { showReportDialog = false },
-                    title = { Text("Report") },
-                    text = {
-                        Column {
-//                                                Text("Report this image?")
-                            Text(
-                                "Report this image if you feel it is inappropriate. Params and image will be sent to the server for review.",
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    },
-                    confirmButton = {
-                        TextButton(
-                            onClick = {
-                                showReportDialog = false
-                                coroutineScope.launch {
-                                    currentBitmap?.let { bitmap ->
-                                        reportImage(
-                                            bitmap = bitmap,
-                                            modelName = model?.name ?: "",
-                                            params = generationParams!!,
-                                            onSuccess = {
-                                                Toast.makeText(
-                                                    context,
-                                                    "Thanks for your report.",
-                                                    Toast.LENGTH_SHORT,
-                                                ).show()
-                                            },
-                                            onError = { error ->
-                                                Toast.makeText(
-                                                    context,
-                                                    "Error: $error",
-                                                    Toast.LENGTH_SHORT,
-                                                ).show()
-                                            },
-                                        )
-                                    }
-                                }
-                            },
-                            colors = ButtonDefaults.textButtonColors(
-                                contentColor = MaterialTheme.colorScheme.error,
-                            ),
-                        ) {
-                            Text("Report")
-                        }
-                    },
-                    dismissButton = {
-                        TextButton(onClick = { showReportDialog = false }) {
-                            Text("Cancel")
-                        }
-                    },
-                )
-            }
-            if (showParametersDialog && generationParams != null) {
-                GenerationParamsDialog(
-                    title = stringResource(R.string.params_detail),
-                    params = generationParams!!,
-                    modelId = generationParamsModelId,
-                    showImg2imgButton = useImg2img,
-                    onShare = {
-                        shareSourceParams = generationParams
-                        shareSourceModelId = generationParamsModelId
-                    },
-                    onSendToImg2img = {
-                        val bmp = currentBitmap
-                        if (bmp != null) {
-                            sendBitmapToImg2img(bmp)
-                            showParametersDialog = false
-                        } else {
-                            Toast.makeText(
-                                context,
-                                "No image available",
-                                Toast.LENGTH_SHORT,
-                            ).show()
-                        }
-                    },
-                    onReproduce = {
-                        generationParams?.let {
-                            pendingReproduceParams = it
-                            showParametersDialog = false
-                            showReproduceParamsDialog = true
-                        }
-                    },
-                    onDismiss = { showParametersDialog = false },
-                )
-            }
-        }
-    }
-
-    @Composable
-    fun HistoryPage() {
-        // History page
-        val locale = LocalConfiguration.current.locales[0]
-        // Handle back button in selection mode
-        BackHandler(enabled = isSelectionMode && !isBatchSaving) {
-            isSelectionMode = false
-            selectedItems.clear()
-        }
-
-        Column(
-            modifier = Modifier.fillMaxSize(),
-        ) {
-            HistoryFilterBar(
-                filter = historyFilter,
-                currentModelId = modelId,
-                onShowFilterSheet = { showHistoryFilterSheet = true },
-                onSetCurrentModelOnly = {
-                    historyFilter = historyFilter.copy(modelIds = setOf(modelId))
-                },
-                onSetAllModels = {
-                    historyFilter = historyFilter.copy(modelIds = null)
-                },
-            )
-            Box(
-                modifier = Modifier
-                    .fillMaxSize(),
-            ) {
-                if (historyItems.isEmpty()) {
-                    var emptyVisible by remember { mutableStateOf(false) }
-                    LaunchedEffect(Unit) { emptyVisible = true }
-                    val emptyAlpha by animateFloatAsState(
-                        targetValue = if (emptyVisible) 1f else 0f,
-                        animationSpec = Motion.Fade,
-                        label = "emptyAlpha",
-                    )
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .alpha(emptyAlpha),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
-                            modifier = Modifier.offset(y = (-60).dp),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Image,
-                                contentDescription = null,
-                                modifier = Modifier.size(64.dp),
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                            Text(
-                                stringResource(R.string.no_history),
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                            Text(
-                                stringResource(R.string.no_history_hint),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                } else {
-                    LazyVerticalGrid(
-                        columns = GridCells.Fixed(2),
-                        contentPadding = PaddingValues(16.dp),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                        modifier = Modifier.fillMaxSize(),
-                    ) {
-                        items(historyItems.size) { index ->
-                            val item = historyItems[index]
-                            val isSelected = selectedItems.contains(item)
-                            Card(
-                                modifier = Modifier.aspectRatio(1f),
-                                shape = MaterialTheme.shapes.medium,
-                                elevation = CardDefaults.cardElevation(
-                                    defaultElevation = 2.dp,
-                                ),
-                            ) {
-                                // Clickable inside the card so its ripple is clipped
-                                // to the rounded shape (square corners otherwise).
-                                Box(
-                                    modifier = Modifier.combinedClickable(
-                                        onClick = {
-                                            if (isSelectionMode) {
-                                                // Toggle selection
-                                                if (isSelected) {
-                                                    selectedItems.remove(item)
-                                                    if (selectedItems.isEmpty()) {
-                                                        isSelectionMode = false
-                                                    }
-                                                } else {
-                                                    selectedItems.add(item)
-                                                }
-                                            } else {
-                                                // Normal preview
-                                                selectedHistoryItem = item
-                                                showHistoryDetailDialog = true
-                                            }
-                                        },
-                                        onLongClick = {
-                                            if (!isSelectionMode) {
-                                                isSelectionMode = true
-                                                selectedItems.clear()
-                                                selectedItems.add(item)
-                                            }
-                                        },
-                                    ),
-                                ) {
-                                    AsyncImage(
-                                        model = ImageRequest.Builder(LocalContext.current)
-                                            .data(item.imageFile)
-                                            .crossfade(true)
-                                            .build(),
-                                        contentDescription = "Generated image",
-                                        modifier = Modifier.fillMaxSize(),
-                                    )
-
-                                    if (isSelected) {
-                                        Box(
-                                            modifier = Modifier
-                                                .fillMaxSize()
-                                                .background(
-                                                    MaterialTheme.colorScheme.primary.copy(
-                                                        alpha = 0.2f,
-                                                    ),
-                                                ),
-                                        )
-                                    }
-
-                                    // Timestamp overlay
-                                    Surface(
-                                        modifier = Modifier.align(Alignment.BottomStart),
-                                        shape = RoundedCornerShape(
-                                            topStart = 0.dp,
-                                            topEnd = 4.dp,
-                                            bottomStart = 12.dp,
-                                            bottomEnd = 0.dp,
-                                        ),
-                                        color = MaterialTheme.colorScheme.surfaceContainerHigh
-                                            .copy(alpha = 0.8f),
-                                    ) {
-                                        Text(
-                                            text = remember(item.timestamp, locale) {
-                                                java.text.SimpleDateFormat(
-                                                    "MM/dd HH:mm",
-                                                    locale,
-                                                ).format(java.util.Date(item.timestamp))
-                                            },
-                                            style = MaterialTheme.typography.labelSmall,
-                                            modifier = Modifier.padding(
-                                                horizontal = 6.dp,
-                                                vertical = 3.dp,
-                                            ),
-                                        )
-                                    }
-
-                                    // Selection indicator
-                                    if (isSelectionMode) {
-                                        Box(
-                                            modifier = Modifier
-                                                .align(Alignment.TopEnd)
-                                                .padding(8.dp)
-                                                .size(24.dp)
-                                                .background(
-                                                    color = if (isSelected) {
-                                                        MaterialTheme.colorScheme.primary
-                                                    } else {
-                                                        MaterialTheme.colorScheme.scrim.copy(alpha = 0.4f)
-                                                    },
-                                                    shape = CircleShape,
-                                                )
-                                                .border(
-                                                    width = 2.dp,
-                                                    color = if (isSelected) {
-                                                        MaterialTheme.colorScheme.primary
-                                                    } else {
-                                                        Color.White
-                                                    },
-                                                    shape = CircleShape,
-                                                ),
-                                            contentAlignment = Alignment.Center,
-                                        ) {
-                                            if (isSelected) {
-                                                Icon(
-                                                    imageVector = Icons.Default.Check,
-                                                    contentDescription = "Selected",
-                                                    tint = MaterialTheme.colorScheme.onPrimary,
-                                                    modifier = Modifier.size(16.dp),
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Floating selection mode bottom bar
-                if (isSelectionMode) {
-                    val visibleItems = historyItems
-                    val isAllSelected =
-                        selectedItems.size == visibleItems.size && visibleItems.all { it in selectedItems }
-                    HorizontalFloatingToolbar(
-                        expanded = true,
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .padding(16.dp),
-                        leadingContent = {
-                            IconButton(
-                                onClick = {
-                                    isSelectionMode = false
-                                    selectedItems.clear()
-                                },
-                                enabled = !isBatchSaving,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = "Exit selection mode",
-                                )
-                            }
-                        },
-                        trailingContent = {
-                            CompositionLocalProvider(
-                                LocalMinimumInteractiveComponentSize provides Dp.Unspecified,
-                            ) {
-                                IconButton(
-                                    onClick = {
-                                        if (isAllSelected) {
-                                            selectedItems.clear()
-                                            isSelectionMode = false
-                                        } else {
-                                            selectedItems.clear()
-                                            selectedItems.addAll(visibleItems)
-                                        }
-                                    },
-                                    enabled = !isBatchSaving,
-                                    colors = IconButtonDefaults.iconButtonColors(
-                                        contentColor = MaterialTheme.colorScheme.primary,
-                                    ),
-                                ) {
-                                    Icon(
-                                        imageVector = if (isAllSelected) {
-                                            Icons.Default.CheckCircle
-                                        } else {
-                                            Icons.Default.CheckCircleOutline
-                                        },
-                                        contentDescription = if (isAllSelected) "Deselect all" else "Select all",
-                                    )
-                                }
-                                IconButton(
-                                    onClick = { showBatchSaveDialog = true },
-                                    enabled = selectedItems.isNotEmpty() && !isBatchSaving,
-                                    colors = IconButtonDefaults.iconButtonColors(
-                                        contentColor = MaterialTheme.colorScheme.primary,
-                                    ),
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Save,
-                                        contentDescription = "Save selected",
-                                    )
-                                }
-                                IconButton(
-                                    onClick = { showBatchDeleteDialog = true },
-                                    enabled = selectedItems.isNotEmpty() && !isBatchSaving,
-                                    colors = IconButtonDefaults.iconButtonColors(
-                                        contentColor = MaterialTheme.colorScheme.error,
-                                    ),
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Delete,
-                                        contentDescription = "Delete selected",
-                                    )
-                                }
-                            }
-                        },
-                    ) {
-                        Text(
-                            text = pluralStringResource(
-                                R.plurals.selected_items_count,
-                                selectedItems.size,
-                                selectedItems.size,
-                            ),
-                            style = MaterialTheme.typography.titleMedium,
-                        )
-                    }
-                }
-            }
-        }
-    }
-
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -3893,8 +2128,113 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                 ) { page ->
                     when (page) {
                         0 -> PromptPage()
-                        1 -> ResultPage()
-                        2 -> HistoryPage()
+
+                        1 -> ModelRunResultPage(
+                            currentBitmap = currentBitmap,
+                            imageVersion = imageVersion,
+                            generationParams = generationParams,
+                            historyItems = historyItems,
+                            showReportButton = BuildConfig.FLAVOR == "filter",
+                            // Upscaling is only offered for the NPU runtime and resolutions <= 1024
+                            showUpscaleButton = !model.runOnCpu &&
+                                generationParams?.let { maxOf(it.width, it.height) <= 1024 } == true,
+                            upscaleEnabled = !isRunning && !isUpscaling,
+                            onReportClick = { showReportDialog = true },
+                            onUpscaleClick = { showUpscalerDialog = true },
+                            onSaveClick = { bitmap ->
+                                handleSaveImage(
+                                    context = context,
+                                    bitmap = bitmap,
+                                    onSuccess = {
+                                        Toast.makeText(
+                                            context,
+                                            msgImageSaved,
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                    },
+                                    onError = { error ->
+                                        Toast.makeText(
+                                            context,
+                                            error,
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                    },
+                                )
+                            },
+                            onPreviewClick = { isPreviewMode = true },
+                            onShowParameters = { showParametersDialog = true },
+                            onHistoryThumbClick = { item ->
+                                scope.launch {
+                                    val bitmap = withContext(Dispatchers.IO) {
+                                        BitmapFactory.decodeFile(item.imageFile.absolutePath)
+                                    }
+                                    if (bitmap != null) {
+                                        currentBitmap = bitmap
+                                        generationParams = item.params
+                                        generationParamsModelId = item.modelId
+                                        currentDisplayedHistoryId = item.id
+                                        imageVersion++
+                                    }
+                                }
+                            },
+                            onGoToGenerate = {
+                                coroutineScope.launch {
+                                    pagerState.animateScrollToPage(0)
+                                }
+                            },
+                        )
+
+                        2 -> ModelRunHistoryPage(
+                            historyFilter = historyFilter,
+                            currentModelId = modelId,
+                            historyItems = historyItems,
+                            isSelectionMode = isSelectionMode,
+                            selectedItems = selectedItems,
+                            isBatchSaving = isBatchSaving,
+                            onFilterChange = { historyFilter = it },
+                            onShowFilterSheet = { showHistoryFilterSheet = true },
+                            onItemClick = { item ->
+                                if (isSelectionMode) {
+                                    // Toggle selection
+                                    if (item in selectedItems) {
+                                        selectedItems.remove(item)
+                                        if (selectedItems.isEmpty()) {
+                                            isSelectionMode = false
+                                        }
+                                    } else {
+                                        selectedItems.add(item)
+                                    }
+                                } else {
+                                    // Normal preview
+                                    selectedHistoryItem = item
+                                    showHistoryDetailDialog = true
+                                }
+                            },
+                            onItemLongClick = { item ->
+                                if (!isSelectionMode) {
+                                    isSelectionMode = true
+                                    selectedItems.clear()
+                                    selectedItems.add(item)
+                                }
+                            },
+                            onExitSelection = {
+                                isSelectionMode = false
+                                selectedItems.clear()
+                            },
+                            onToggleSelectAll = {
+                                val isAllSelected = selectedItems.size == historyItems.size &&
+                                    historyItems.all { it in selectedItems }
+                                if (isAllSelected) {
+                                    selectedItems.clear()
+                                    isSelectionMode = false
+                                } else {
+                                    selectedItems.clear()
+                                    selectedItems.addAll(historyItems)
+                                }
+                            },
+                            onBatchSave = { showBatchSaveDialog = true },
+                            onBatchDelete = { showBatchDeleteDialog = true },
+                        )
                     }
                 }
             }
@@ -3932,6 +2272,78 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
             )
         }
     }
+    if (showReportDialog && currentBitmap != null && generationParams != null) {
+        ModelRunConfirmDialog(
+            title = "Report",
+            text = "Report this image if you feel it is inappropriate. " +
+                "Params and image will be sent to the server for review.",
+            confirmText = "Report",
+            dismissText = "Cancel",
+            destructiveConfirm = true,
+            onConfirm = {
+                showReportDialog = false
+                coroutineScope.launch {
+                    currentBitmap?.let { bitmap ->
+                        reportImage(
+                            bitmap = bitmap,
+                            modelName = model?.name ?: "",
+                            params = generationParams!!,
+                            onSuccess = {
+                                Toast.makeText(
+                                    context,
+                                    "Thanks for your report.",
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            },
+                            onError = { error ->
+                                Toast.makeText(
+                                    context,
+                                    "Error: $error",
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            },
+                        )
+                    }
+                }
+            },
+            onDismiss = { showReportDialog = false },
+        )
+    }
+
+    if (showParametersDialog && generationParams != null) {
+        GenerationParamsDialog(
+            title = stringResource(R.string.params_detail),
+            params = generationParams!!,
+            modelId = generationParamsModelId,
+            showImg2imgButton = useImg2img,
+            onShare = {
+                shareSourceParams = generationParams
+                shareSourceModelId = generationParamsModelId
+            },
+            onSendToImg2img = {
+                val bmp = currentBitmap
+                if (bmp != null) {
+                    sendBitmapToImg2img(bmp)
+                    showParametersDialog = false
+                } else {
+                    Toast.makeText(
+                        context,
+                        "No image available",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            },
+            onReproduce = {
+                generationParams?.let {
+                    pendingReproduceParams = it
+                    showParametersDialog = false
+                    showReproduceParamsDialog = true
+                }
+            },
+            onDismiss = { showParametersDialog = false },
+        )
+    }
+
     if (isPreviewMode && currentBitmap != null) {
         ZoomableImageOverlay(
             bitmap = currentBitmap,
@@ -3949,162 +2361,80 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
 
     // Upscaler dialog
     if (showUpscalerDialog) {
-        var tempSelectedUpscalerId by remember {
-            mutableStateOf(upscalerPreferences.getString("${modelId}_selected_upscaler", null))
-        }
-        var downloadingUpscalerId by remember { mutableStateOf<String?>(null) }
-        var downloadProgress by remember { mutableStateOf<DownloadProgress?>(null) }
-
-        val downloadState by ModelDownloadService.downloadState.collectAsState()
-
-        LaunchedEffect(downloadState) {
-            when (val state = downloadState) {
-                is ModelDownloadService.DownloadState.Downloading -> {
-                    val upscaler = upscalerRepository.upscalers.find { it.id == state.modelId }
-                    if (upscaler != null) {
-                        downloadingUpscalerId = upscaler.id
-                        downloadProgress = DownloadProgress(
-                            progress = state.progress,
-                            downloadedBytes = state.downloadedBytes,
-                            totalBytes = state.totalBytes,
-                        )
-                    }
-                }
-
-                is ModelDownloadService.DownloadState.Success -> {
-                    upscalerRepository.refreshUpscalerState(state.modelId)
-                    downloadingUpscalerId = null
-                    downloadProgress = null
-                    Toast.makeText(
-                        context,
-                        msgDownloadDone,
-                        Toast.LENGTH_SHORT,
-                    ).show()
-                }
-
-                is ModelDownloadService.DownloadState.Error -> {
-                    downloadingUpscalerId = null
-                    downloadProgress = null
-                    Toast.makeText(
-                        context,
-                        msgErrorDownloadFailed.format(state.message),
-                        Toast.LENGTH_SHORT,
-                    ).show()
-                }
-
-                is ModelDownloadService.DownloadState.Extracting -> {
-                    val upscaler = upscalerRepository.upscalers.find { it.id == state.modelId }
-                    if (upscaler != null) {
-                        downloadingUpscalerId = upscaler.id
-                        downloadProgress = null // Indeterminate progress during extraction
-                    }
-                }
-
-                is ModelDownloadService.DownloadState.Idle -> {
-                    if (downloadingUpscalerId != null && downloadProgress == null) {
-                        downloadingUpscalerId = null
-                    }
-                }
-            }
-        }
-
-        UpscalerSelectDialog(
-            upscalers = upscalerRepository.upscalers,
-            selectedUpscalerId = tempSelectedUpscalerId,
-            downloadingUpscalerId = downloadingUpscalerId,
-            downloadProgress = downloadProgress,
+        UpscalerPickerFlow(
+            modelId = modelId,
+            upscalerRepository = upscalerRepository,
+            upscalerPreferences = upscalerPreferences,
             onDismiss = { showUpscalerDialog = false },
-            onSelectUpscaler = { upscalerId ->
-                tempSelectedUpscalerId = upscalerId
-            },
-            onConfirm = {
-                val selectedUpscaler =
-                    upscalerRepository.upscalers.find { it.id == tempSelectedUpscalerId }
-                if (selectedUpscaler != null && selectedUpscaler.isDownloaded) {
-                    // Save selection
-                    upscalerPreferences.edit {
-                        putString("${modelId}_selected_upscaler", selectedUpscaler.id)
-                    }
-                    showUpscalerDialog = false
+            onUpscalerConfirmed = { selectedUpscaler ->
+                showUpscalerDialog = false
 
-                    // Execute upscale
-                    currentBitmap?.let { bitmap ->
-                        // If the source image is stitch-eligible (an inpaint result or
-                        // an upscaled copy of one), its upscaled copy is too.
-                        val sourceIsStitchable =
-                            currentDisplayedHistoryId != null &&
-                                currentDisplayedHistoryId in stitchableHistoryIds
-                        isUpscaling = true
-                        scope.launch {
-                            try {
-                                val upscaledBitmap = performUpscale(
-                                    context = context,
-                                    bitmap = bitmap,
-                                    upscalerId = selectedUpscaler.id,
-                                )
+                // Execute upscale
+                currentBitmap?.let { bitmap ->
+                    // If the source image is stitch-eligible (an inpaint result or
+                    // an upscaled copy of one), its upscaled copy is too.
+                    val sourceIsStitchable =
+                        currentDisplayedHistoryId != null &&
+                            currentDisplayedHistoryId in stitchableHistoryIds
+                    isUpscaling = true
+                    scope.launch {
+                        try {
+                            val upscaledBitmap = performUpscale(
+                                context = context,
+                                bitmap = bitmap,
+                                upscalerId = selectedUpscaler.id,
+                            )
 
-                                // Save upscaled image via HistoryManager (DB + JPG file)
-                                generationParams?.let { params ->
-                                    scope.launch(Dispatchers.IO) {
-                                        try {
-                                            val updatedParams = params.copy(
-                                                width = upscaledBitmap.width,
-                                                height = upscaledBitmap.height,
-                                            )
-                                            val sourceMode = selectedHistoryItem?.mode
-                                                ?: GenerationMode.UNKNOWN
-                                            val saved = historyManager.saveGeneratedImage(
-                                                modelId = modelId,
-                                                bitmap = upscaledBitmap,
-                                                params = updatedParams,
-                                                mode = sourceMode,
-                                                upscalerId = selectedUpscaler.id,
-                                            )
-                                            if (saved != null) {
-                                                withContext(Dispatchers.Main) {
-                                                    currentBitmap = upscaledBitmap
-                                                    generationParams = updatedParams
-                                                    generationParamsModelId = modelId
-                                                    currentDisplayedHistoryId = saved.id
-                                                    if (sourceIsStitchable) {
-                                                        stitchableHistoryIds =
-                                                            stitchableHistoryIds + saved.id
-                                                    }
-                                                    imageVersion++
+                            // Save upscaled image via HistoryManager (DB + JPG file)
+                            generationParams?.let { params ->
+                                scope.launch(Dispatchers.IO) {
+                                    try {
+                                        val updatedParams = params.copy(
+                                            width = upscaledBitmap.width,
+                                            height = upscaledBitmap.height,
+                                        )
+                                        val sourceMode = selectedHistoryItem?.mode
+                                            ?: GenerationMode.UNKNOWN
+                                        val saved = historyManager.saveGeneratedImage(
+                                            modelId = modelId,
+                                            bitmap = upscaledBitmap,
+                                            params = updatedParams,
+                                            mode = sourceMode,
+                                            upscalerId = selectedUpscaler.id,
+                                        )
+                                        if (saved != null) {
+                                            withContext(Dispatchers.Main) {
+                                                currentBitmap = upscaledBitmap
+                                                generationParams = updatedParams
+                                                generationParamsModelId = modelId
+                                                currentDisplayedHistoryId = saved.id
+                                                if (sourceIsStitchable) {
+                                                    stitchableHistoryIds =
+                                                        stitchableHistoryIds + saved.id
                                                 }
+                                                imageVersion++
                                             }
-                                        } catch (e: Exception) {
-                                            Log.e(
-                                                "ModelRunScreen",
-                                                "Failed to save upscaled image",
-                                                e,
-                                            )
                                         }
+                                    } catch (e: Exception) {
+                                        Log.e(
+                                            "ModelRunScreen",
+                                            "Failed to save upscaled image",
+                                            e,
+                                        )
                                     }
                                 }
-                            } catch (e: Exception) {
-                                Toast.makeText(
-                                    context,
-                                    msgUpscaleFailed.format(e.message ?: "Unknown error"),
-                                    Toast.LENGTH_SHORT,
-                                ).show()
-                            } finally {
-                                isUpscaling = false
                             }
+                        } catch (e: Exception) {
+                            Toast.makeText(
+                                context,
+                                msgUpscaleFailed.format(e.message ?: "Unknown error"),
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        } finally {
+                            isUpscaling = false
                         }
                     }
-                } else if (selectedUpscaler != null) {
-                    Toast.makeText(
-                        context,
-                        msgDownloadModelFirst,
-                        Toast.LENGTH_SHORT,
-                    ).show()
                 }
-            },
-            onDownload = { upscaler ->
-                downloadingUpscalerId = upscaler.id
-                downloadProgress = null
-                upscaler.startDownload(context)
             },
         )
     }
@@ -4143,8 +2473,11 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
 
     // History detail dialog
     if (showHistoryDetailDialog && selectedHistoryItem != null) {
-        val historyBitmap = remember(selectedHistoryItem?.imageFile?.absolutePath) {
-            BitmapFactory.decodeFile(selectedHistoryItem!!.imageFile.absolutePath)
+        val detailImagePath = selectedHistoryItem?.imageFile?.absolutePath
+        val historyBitmap by produceState<Bitmap?>(null, detailImagePath) {
+            value = withContext(Dispatchers.IO) {
+                detailImagePath?.let { BitmapFactory.decodeFile(it) }
+            }
         }
         val dismissDetail = {
             showHistoryDetailDialog = false
@@ -4167,11 +2500,12 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                     icon = Icons.Default.Save,
                     contentDescription = "Save to gallery",
                     onClick = {
-                        if (historyBitmap != null) {
+                        val bitmapToSave = historyBitmap
+                        if (bitmapToSave != null) {
                             scope.launch {
                                 saveImage(
                                     context = context,
-                                    bitmap = historyBitmap,
+                                    bitmap = bitmapToSave,
                                     onSuccess = {
                                         Toast.makeText(
                                             context,
@@ -4211,18 +2545,22 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
             onSendToImg2img = {
                 val item = selectedHistoryItem
                 if (item != null) {
-                    val bmp = BitmapFactory.decodeFile(item.imageFile.absolutePath)
-                    if (bmp != null) {
-                        sendBitmapToImg2img(bmp)
-                        showHistoryParametersDialog = false
-                        showHistoryDetailDialog = false
-                        selectedHistoryItem = null
-                    } else {
-                        Toast.makeText(
-                            context,
-                            "Failed to load image",
-                            Toast.LENGTH_SHORT,
-                        ).show()
+                    scope.launch {
+                        val bmp = withContext(Dispatchers.IO) {
+                            BitmapFactory.decodeFile(item.imageFile.absolutePath)
+                        }
+                        if (bmp != null) {
+                            sendBitmapToImg2img(bmp)
+                            showHistoryParametersDialog = false
+                            showHistoryDetailDialog = false
+                            selectedHistoryItem = null
+                        } else {
+                            Toast.makeText(
+                                context,
+                                "Failed to load image",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        }
                     }
                 }
             },
@@ -4242,15 +2580,10 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
             params = params,
             onApply = { selectedFields ->
                 if (ParamShareField.PROMPT in selectedFields) {
-                    prompt = params.prompt
-                    promptFieldValue = TextFieldValue(prompt, TextRange(prompt.length))
-                    promptSuggestions = emptyList()
+                    promptField.replaceText(params.prompt)
                 }
                 if (ParamShareField.NEGATIVE_PROMPT in selectedFields) {
-                    negativePrompt = params.negativePrompt
-                    negativePromptFieldValue =
-                        TextFieldValue(negativePrompt, TextRange(negativePrompt.length))
-                    negativePromptSuggestions = emptyList()
+                    negativePromptField.replaceText(params.negativePrompt)
                 }
                 if (ParamShareField.STEPS in selectedFields) {
                     steps = params.steps.toFloat()
@@ -4295,228 +2628,155 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
 
     // Delete confirmation dialog
     if (showDeleteHistoryDialog && selectedHistoryItem != null) {
-        AlertDialog(
-            onDismissRequest = { showDeleteHistoryDialog = false },
-            title = { Text(stringResource(R.string.delete_image)) },
-            text = { Text(stringResource(R.string.delete_image_confirm)) },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        scope.launch {
-                            val success = historyManager.deleteHistoryItem(
-                                item = selectedHistoryItem!!,
-                            )
-                            if (success) {
-                                showDeleteHistoryDialog = false
-                                showHistoryDetailDialog = false
-                                selectedHistoryItem = null
-                                Toast.makeText(
-                                    context,
-                                    msgDeleted,
-                                    Toast.LENGTH_SHORT,
-                                ).show()
-                            } else {
-                                Toast.makeText(
-                                    context,
-                                    msgDeleteFailedMessage,
-                                    Toast.LENGTH_SHORT,
-                                ).show()
-                            }
-                        }
-                    },
-                ) {
-                    Text(
-                        stringResource(R.string.delete),
-                        color = MaterialTheme.colorScheme.error,
+        ModelRunConfirmDialog(
+            title = stringResource(R.string.delete_image),
+            text = stringResource(R.string.delete_image_confirm),
+            confirmText = stringResource(R.string.delete),
+            destructiveConfirm = true,
+            onConfirm = {
+                scope.launch {
+                    val success = historyManager.deleteHistoryItem(
+                        item = selectedHistoryItem!!,
                     )
+                    if (success) {
+                        showDeleteHistoryDialog = false
+                        showHistoryDetailDialog = false
+                        selectedHistoryItem = null
+                        Toast.makeText(
+                            context,
+                            msgDeleted,
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    } else {
+                        Toast.makeText(
+                            context,
+                            msgDeleteFailedMessage,
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
                 }
             },
-            dismissButton = {
-                TextButton(onClick = { showDeleteHistoryDialog = false }) {
-                    Text(stringResource(R.string.cancel))
-                }
-            },
+            onDismiss = { showDeleteHistoryDialog = false },
         )
     }
 
     // Batch save confirmation dialog
     if (showBatchSaveDialog && selectedItems.isNotEmpty()) {
-        AlertDialog(
-            onDismissRequest = { showBatchSaveDialog = false },
-            title = { Text(stringResource(R.string.batch_save)) },
-            text = {
-                Text(
-                    pluralStringResource(
-                        R.plurals.batch_save_confirm,
-                        selectedItems.size,
-                        selectedItems.size,
-                    ),
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        val items = selectedItems.toList()
-                        showBatchSaveDialog = false
-                        if (items.isEmpty()) return@TextButton
-                        batchSaveTotal = items.size
-                        batchSaveCurrent = 0
-                        batchSaveFailed = 0
-                        isBatchSaving = true
-                        scope.launch(Dispatchers.IO) {
-                            items.forEach { item ->
-                                var success = false
-                                if (item.imageFile.exists()) {
-                                    saveImageFromFile(
-                                        context = context,
-                                        sourceFile = item.imageFile,
-                                        onSuccess = { success = true },
-                                        onError = { },
-                                    )
-                                }
-                                withContext(Dispatchers.Main) {
-                                    batchSaveCurrent += 1
-                                    if (!success) batchSaveFailed += 1
-                                }
+        ModelRunConfirmDialog(
+            title = stringResource(R.string.batch_save),
+            text = pluralStringResource(
+                R.plurals.batch_save_confirm,
+                selectedItems.size,
+                selectedItems.size,
+            ),
+            confirmText = stringResource(R.string.yes),
+            onConfirm = {
+                val items = selectedItems.toList()
+                showBatchSaveDialog = false
+                if (items.isNotEmpty()) {
+                    batchSaveTotal = items.size
+                    batchSaveCurrent = 0
+                    batchSaveFailed = 0
+                    isBatchSaving = true
+                    scope.launch(Dispatchers.IO) {
+                        items.forEach { item ->
+                            var success = false
+                            if (item.imageFile.exists()) {
+                                saveImageFromFile(
+                                    context = context,
+                                    sourceFile = item.imageFile,
+                                    onSuccess = { success = true },
+                                    onError = { },
+                                )
                             }
                             withContext(Dispatchers.Main) {
-                                val total = batchSaveTotal
-                                val failed = batchSaveFailed
-                                val saved = total - failed
-                                val message = if (failed == 0) {
-                                    resources.getQuantityString(
-                                        R.plurals.saved_count,
-                                        saved,
-                                        saved,
-                                    )
-                                } else {
-                                    msgSavedCountWithFailed.format(saved, failed)
-                                }
-                                Toast.makeText(
-                                    context,
-                                    message,
-                                    Toast.LENGTH_SHORT,
-                                ).show()
-                                isBatchSaving = false
-                                selectedItems.clear()
-                                isSelectionMode = false
+                                batchSaveCurrent += 1
+                                if (!success) batchSaveFailed += 1
                             }
                         }
-                    },
-                ) {
-                    Text(stringResource(R.string.yes))
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showBatchSaveDialog = false }) {
-                    Text(stringResource(R.string.cancel))
-                }
-            },
-        )
-    }
-
-    // Batch save progress dialog (modal — blocks other interactions)
-    if (isBatchSaving) {
-        AlertDialog(
-            onDismissRequest = { /* not dismissable */ },
-            properties = DialogProperties(
-                dismissOnBackPress = false,
-                dismissOnClickOutside = false,
-            ),
-            title = { Text(stringResource(R.string.batch_save)) },
-            text = {
-                Column(
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text(
-                        stringResource(
-                            R.string.batch_saving_progress,
-                            batchSaveCurrent,
-                            batchSaveTotal,
-                        ),
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                    val saveProgress = if (batchSaveTotal > 0) {
-                        batchSaveCurrent.toFloat() / batchSaveTotal
-                    } else {
-                        0f
-                    }
-                    SmoothLinearWavyProgressIndicator(
-                        progress = saveProgress,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-            },
-            confirmButton = {},
-        )
-    }
-
-    // Batch delete confirmation dialog
-    if (showBatchDeleteDialog && selectedItems.isNotEmpty()) {
-        AlertDialog(
-            onDismissRequest = { showBatchDeleteDialog = false },
-            title = { Text(stringResource(R.string.batch_delete)) },
-            text = {
-                Text(
-                    pluralStringResource(
-                        R.plurals.batch_delete_confirm,
-                        selectedItems.size,
-                        selectedItems.size,
-                    ),
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        scope.launch {
-                            val itemsToDelete = selectedItems.toList()
-                            var successCount = 0
-                            var failCount = 0
-
-                            itemsToDelete.forEach { item ->
-                                val success = historyManager.deleteHistoryItem(
-                                    item = item,
-                                )
-                                if (success) {
-                                    successCount++
-                                } else {
-                                    failCount++
-                                }
-                            }
-
-                            selectedItems.clear()
-                            isSelectionMode = false
-                            showBatchDeleteDialog = false
-
-                            val message = if (failCount == 0) {
+                        withContext(Dispatchers.Main) {
+                            val total = batchSaveTotal
+                            val failed = batchSaveFailed
+                            val saved = total - failed
+                            val message = if (failed == 0) {
                                 resources.getQuantityString(
-                                    R.plurals.deleted_count,
-                                    successCount,
-                                    successCount,
+                                    R.plurals.saved_count,
+                                    saved,
+                                    saved,
                                 )
                             } else {
-                                msgDeletedCountWithFailed.format(successCount, failCount)
+                                msgSavedCountWithFailed.format(saved, failed)
                             }
                             Toast.makeText(
                                 context,
                                 message,
                                 Toast.LENGTH_SHORT,
                             ).show()
+                            isBatchSaving = false
+                            selectedItems.clear()
+                            isSelectionMode = false
                         }
-                    },
-                ) {
-                    Text(
-                        stringResource(R.string.delete),
-                        color = MaterialTheme.colorScheme.error,
-                    )
+                    }
                 }
             },
-            dismissButton = {
-                TextButton(onClick = { showBatchDeleteDialog = false }) {
-                    Text(stringResource(R.string.cancel))
+            onDismiss = { showBatchSaveDialog = false },
+        )
+    }
+
+    // Batch save progress dialog (modal — blocks other interactions)
+    if (isBatchSaving) {
+        BatchSaveProgressDialog(current = batchSaveCurrent, total = batchSaveTotal)
+    }
+
+    // Batch delete confirmation dialog
+    if (showBatchDeleteDialog && selectedItems.isNotEmpty()) {
+        ModelRunConfirmDialog(
+            title = stringResource(R.string.batch_delete),
+            text = pluralStringResource(
+                R.plurals.batch_delete_confirm,
+                selectedItems.size,
+                selectedItems.size,
+            ),
+            confirmText = stringResource(R.string.delete),
+            destructiveConfirm = true,
+            onConfirm = {
+                scope.launch {
+                    val itemsToDelete = selectedItems.toList()
+                    var successCount = 0
+                    var failCount = 0
+
+                    itemsToDelete.forEach { item ->
+                        val success = historyManager.deleteHistoryItem(
+                            item = item,
+                        )
+                        if (success) {
+                            successCount++
+                        } else {
+                            failCount++
+                        }
+                    }
+
+                    selectedItems.clear()
+                    isSelectionMode = false
+                    showBatchDeleteDialog = false
+
+                    val message = if (failCount == 0) {
+                        resources.getQuantityString(
+                            R.plurals.deleted_count,
+                            successCount,
+                            successCount,
+                        )
+                    } else {
+                        msgDeletedCountWithFailed.format(successCount, failCount)
+                    }
+                    Toast.makeText(
+                        context,
+                        message,
+                        Toast.LENGTH_SHORT,
+                    ).show()
                 }
             },
+            onDismiss = { showBatchDeleteDialog = false },
         )
     }
 
@@ -4638,19 +2898,10 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
             },
             onApply = { selectedFields, clearClipboard ->
                 if (ParamShareField.PROMPT in selectedFields) {
-                    imported.prompt?.let {
-                        prompt = it
-                        promptFieldValue = TextFieldValue(it, TextRange(it.length))
-                        promptSuggestions = emptyList()
-                    }
+                    imported.prompt?.let { promptField.replaceText(it) }
                 }
                 if (ParamShareField.NEGATIVE_PROMPT in selectedFields) {
-                    imported.negativePrompt?.let {
-                        negativePrompt = it
-                        negativePromptFieldValue =
-                            TextFieldValue(it, TextRange(it.length))
-                        negativePromptSuggestions = emptyList()
-                    }
+                    imported.negativePrompt?.let { negativePromptField.replaceText(it) }
                 }
                 if (ParamShareField.STEPS in selectedFields) {
                     imported.steps?.let { steps = it.toFloat() }
@@ -4685,136 +2936,6 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
                 pendingImport = null
             },
         )
-    }
-}
-
-@Composable
-fun UpscalerSelectDialog(
-    upscalers: List<UpscalerModel>,
-    selectedUpscalerId: String?,
-    downloadingUpscalerId: String?,
-    downloadProgress: DownloadProgress?,
-    onDismiss: () -> Unit,
-    onSelectUpscaler: (String) -> Unit,
-    onConfirm: () -> Unit,
-    onDownload: (UpscalerModel) -> Unit,
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.select_upscaler_model)) },
-        text = {
-            LazyColumn(
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                items(upscalers) { upscaler ->
-                    UpscalerModelCard(
-                        upscaler = upscaler,
-                        isSelected = upscaler.id == selectedUpscalerId,
-                        isDownloading = upscaler.id == downloadingUpscalerId,
-                        downloadProgress = if (upscaler.id == downloadingUpscalerId) downloadProgress else null,
-                        onSelect = { onSelectUpscaler(upscaler.id) },
-                        onDownload = { onDownload(upscaler) },
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(onClick = onDismiss) {
-                    Text(stringResource(R.string.cancel))
-                }
-                Button(
-                    onClick = onConfirm,
-                    enabled = selectedUpscalerId != null,
-                ) {
-                    Text(stringResource(R.string.confirm))
-                }
-            }
-        },
-    )
-}
-
-@OptIn(ExperimentalMaterial3ExpressiveApi::class)
-@Composable
-fun UpscalerModelCard(
-    upscaler: UpscalerModel,
-    isSelected: Boolean,
-    isDownloading: Boolean,
-    downloadProgress: DownloadProgress?,
-    onSelect: () -> Unit,
-    onDownload: () -> Unit,
-) {
-    Card(
-        onClick = onSelect,
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = if (isSelected) {
-                MaterialTheme.colorScheme.primaryContainer
-            } else {
-                MaterialTheme.colorScheme.surface
-            },
-        ),
-        border = if (isSelected) {
-            BorderStroke(2.dp, MaterialTheme.colorScheme.primary)
-        } else {
-            null
-        },
-    ) {
-        Column(modifier = Modifier.fillMaxWidth()) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = upscaler.name,
-                        style = MaterialTheme.typography.titleMedium,
-                    )
-                    Text(
-                        text = upscaler.description,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-
-                if (isDownloading) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(24.dp),
-                        strokeWidth = 2.dp,
-                    )
-                } else if (!upscaler.isDownloaded) {
-                    FilledTonalButton(onClick = onDownload) {
-                        Icon(
-                            imageVector = Icons.Default.Download,
-                            contentDescription = stringResource(R.string.download),
-                            modifier = Modifier.size(18.dp),
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(stringResource(R.string.download))
-                    }
-                } else if (isSelected) {
-                    Icon(
-                        imageVector = Icons.Default.CheckCircle,
-                        contentDescription = "selected",
-                        tint = MaterialTheme.colorScheme.primary,
-                    )
-                }
-            }
-
-            // Show progress bar when downloading
-            if (isDownloading && downloadProgress != null) {
-                SmoothLinearWavyProgressIndicator(
-                    progress = downloadProgress.progress,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp)
-                        .padding(bottom = 16.dp),
-                )
-            }
-        }
     }
 }
 

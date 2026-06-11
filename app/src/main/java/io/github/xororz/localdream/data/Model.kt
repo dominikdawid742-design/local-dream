@@ -1,5 +1,6 @@
 package io.github.xororz.localdream.data
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.os.Build
@@ -11,10 +12,10 @@ import androidx.compose.runtime.setValue
 import io.github.xororz.localdream.R
 import io.github.xororz.localdream.service.ModelDownloadService
 import java.io.File
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 @Immutable
 data class Resolution(val width: Int, val height: Int) {
@@ -58,7 +59,7 @@ object PatchScanner {
             }
         }
 
-        return resolutions.sortedBy { it.width * it.height }.distinct()
+        return resolutions.distinct().sortedBy { it.width * it.height }
     }
 }
 
@@ -142,27 +143,27 @@ data class Model(
         context.startForegroundService(intent)
     }
 
-    fun deleteModel(context: Context): Boolean = try {
-        val modelDir = File(getModelsDir(context), id)
-        val historyManager = HistoryManager(context)
-        val generationPreferences = GenerationPreferences(context)
+    suspend fun deleteModel(context: Context): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val modelDir = File(getModelsDir(context), id)
+            val historyManager = HistoryManager(context)
+            val generationPreferences = GenerationPreferences(context)
 
-        runBlocking {
             historyManager.clearHistoryForModel(id)
             generationPreferences.clearPreferencesForModel(id)
-        }
 
-        if (modelDir.exists() && modelDir.isDirectory) {
-            val deleted = modelDir.deleteRecursively()
-            Log.d("Model", "Delete model $id: $deleted")
-            deleted
-        } else {
-            Log.d("Model", "Model does not exist: $id")
+            if (modelDir.exists() && modelDir.isDirectory) {
+                val deleted = modelDir.deleteRecursively()
+                Log.d("Model", "Delete model $id: $deleted")
+                deleted
+            } else {
+                Log.d("Model", "Model does not exist: $id")
+                false
+            }
+        } catch (e: Exception) {
+            Log.e("Model", "error: ${e.message}")
             false
         }
-    } catch (e: Exception) {
-        Log.e("Model", "error: ${e.message}")
-        false
     }
 
     companion object {
@@ -246,37 +247,36 @@ data class UpscalerModel(
     }
 }
 
-class UpscalerRepository(private val context: Context) {
+class UpscalerRepository private constructor(private val context: Context) {
     private val generationPreferences = GenerationPreferences(context)
+    private val refreshMutex = Mutex()
 
-    private var _baseUrl = mutableStateOf("https://huggingface.co/")
-    var baseUrl: String
-        get() = _baseUrl.value
-        private set(value) {
-            _baseUrl.value = value
-        }
-
-    var upscalers by mutableStateOf(initializeUpscalers())
+    var upscalers by mutableStateOf<List<UpscalerModel>>(emptyList())
         private set
 
-    init {
-        CoroutineScope(Dispatchers.Main).launch {
-            baseUrl = generationPreferences.getBaseUrl()
-            upscalers = initializeUpscalers()
+    private var isLoaded = false
+
+    suspend fun ensureLoaded() {
+        if (isLoaded) return
+        refreshMutex.withLock {
+            if (isLoaded) return
+            val baseUrl = generationPreferences.getBaseUrl()
+            upscalers = withContext(Dispatchers.IO) { initializeUpscalers(baseUrl) }
+            isLoaded = true
         }
     }
 
-    private fun initializeUpscalers(): List<UpscalerModel> {
+    private fun initializeUpscalers(baseUrl: String): List<UpscalerModel> {
         val soc = getDeviceSoc()
         val suffix = Model.getChipsetSuffix(soc) ?: "min"
 
         return listOf(
-            createAnimeUpscaler(suffix),
-            createRealisticUpscaler(suffix),
+            createAnimeUpscaler(baseUrl, suffix),
+            createRealisticUpscaler(baseUrl, suffix),
         )
     }
 
-    private fun createAnimeUpscaler(suffix: String): UpscalerModel {
+    private fun createAnimeUpscaler(baseUrl: String, suffix: String): UpscalerModel {
         val id = "upscaler_anime"
         val fileUri =
             "xororz/upscaler/resolve/main/realesrgan_x4plus_anime_6b/upscaler_$suffix.bin"
@@ -293,7 +293,7 @@ class UpscalerRepository(private val context: Context) {
         )
     }
 
-    private fun createRealisticUpscaler(suffix: String): UpscalerModel {
+    private fun createRealisticUpscaler(baseUrl: String, suffix: String): UpscalerModel {
         val id = "upscaler_realistic"
         val fileUri = "xororz/upscaler/resolve/main/4x_UltraSharpV2_Lite/upscaler_$suffix.bin"
 
@@ -309,36 +309,52 @@ class UpscalerRepository(private val context: Context) {
         )
     }
 
-    fun refreshUpscalerState(upscalerId: String) {
-        upscalers = upscalers.map { upscaler ->
-            if (upscaler.id == upscalerId) {
-                val isDownloaded = Model.isModelDownloaded(context, upscaler.id, false)
-                upscaler.copy(isDownloaded = isDownloaded)
-            } else {
-                upscaler
+    suspend fun refreshUpscalerState(upscalerId: String) {
+        refreshMutex.withLock {
+            val current = upscalers
+            upscalers = withContext(Dispatchers.IO) {
+                current.map { upscaler ->
+                    if (upscaler.id == upscalerId) {
+                        val isDownloaded = Model.isModelDownloaded(context, upscaler.id, false)
+                        upscaler.copy(isDownloaded = isDownloaded)
+                    } else {
+                        upscaler
+                    }
+                }
             }
+        }
+    }
+
+    companion object {
+        @SuppressLint("StaticFieldLeak")
+        @Volatile
+        private var instance: UpscalerRepository? = null
+
+        fun getInstance(context: Context): UpscalerRepository = instance ?: synchronized(this) {
+            instance ?: UpscalerRepository(context.applicationContext).also { instance = it }
         }
     }
 }
 
-class ModelRepository(private val context: Context) {
+class ModelRepository private constructor(private val context: Context) {
     private val generationPreferences = GenerationPreferences(context)
+    private val refreshMutex = Mutex()
 
-    private var _baseUrl = mutableStateOf("https://huggingface.co/")
-    var baseUrl: String
-        get() = _baseUrl.value
-        private set(value) {
-            _baseUrl.value = value
-        }
+    // Read by the create*Model() builders during a scan; refreshed from
+    // preferences at the start of every refresh, always under refreshMutex.
+    private var baseUrl = "https://huggingface.co/"
 
-    var models by mutableStateOf(initializeModels())
+    var models by mutableStateOf<List<Model>>(emptyList())
         private set
 
-    init {
-        CoroutineScope(Dispatchers.Main).launch {
-            baseUrl = generationPreferences.getBaseUrl()
-            models = initializeModels()
-        }
+    // False until the first disk scan completes; lets the UI tell "still
+    // loading" apart from "genuinely no models".
+    var isLoaded by mutableStateOf(false)
+        private set
+
+    suspend fun ensureLoaded() {
+        if (isLoaded) return
+        refreshAllModels()
     }
 
     private fun scanCustomModels(): List<Model> {
@@ -767,29 +783,39 @@ class ModelRepository(private val context: Context) {
         )
     }
 
-    fun refreshModelState(modelId: String) {
-        models = models.map { model ->
-            if (model.id == modelId) {
-                val isDownloaded = Model.isModelDownloaded(context, modelId, model.isCustom)
-                val needsUpgrade = if (!model.runOnCpu) {
-                    Model.needsModelUpgrade(context, modelId, true)
-                } else {
-                    false
+    suspend fun refreshModelState(modelId: String) {
+        refreshMutex.withLock {
+            val current = models
+            models = withContext(Dispatchers.IO) {
+                current.map { model ->
+                    if (model.id == modelId) {
+                        val isDownloaded =
+                            Model.isModelDownloaded(context, modelId, model.isCustom)
+                        val needsUpgrade = if (!model.runOnCpu) {
+                            Model.needsModelUpgrade(context, modelId, true)
+                        } else {
+                            false
+                        }
+                        applyConfigDefaults(
+                            model.copy(
+                                isDownloaded = isDownloaded,
+                                needsUpgrade = needsUpgrade,
+                            ),
+                        )
+                    } else {
+                        model
+                    }
                 }
-                applyConfigDefaults(
-                    model.copy(
-                        isDownloaded = isDownloaded,
-                        needsUpgrade = needsUpgrade,
-                    ),
-                )
-            } else {
-                model
             }
         }
     }
 
-    fun refreshAllModels() {
-        models = initializeModels()
+    suspend fun refreshAllModels() {
+        refreshMutex.withLock {
+            baseUrl = generationPreferences.getBaseUrl()
+            models = withContext(Dispatchers.IO) { initializeModels() }
+            isLoaded = true
+        }
     }
 
     companion object {
@@ -809,5 +835,13 @@ class ModelRepository(private val context: Context) {
         )
 
         fun isReservedModelId(id: String): Boolean = id in RESERVED_MODEL_IDS
+
+        @SuppressLint("StaticFieldLeak")
+        @Volatile
+        private var instance: ModelRepository? = null
+
+        fun getInstance(context: Context): ModelRepository = instance ?: synchronized(this) {
+            instance ?: ModelRepository(context.applicationContext).also { instance = it }
+        }
     }
 }

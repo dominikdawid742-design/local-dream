@@ -30,6 +30,14 @@ import org.json.JSONObject
 
 private val saveSequence = AtomicLong(0L)
 
+private val reportClient: OkHttpClient by lazy {
+    Http.client.newBuilder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .build()
+}
+
 private fun nextSaveFilename(extension: String): String {
     val ts = System.currentTimeMillis()
     val seq = saveSequence.getAndIncrement()
@@ -170,12 +178,6 @@ suspend fun reportImage(
                 put("image_data", base64Image)
             }
 
-            val client = OkHttpClient.Builder()
-                .connectTimeout(30, TimeUnit.SECONDS)
-                .writeTimeout(60, TimeUnit.SECONDS)
-                .readTimeout(30, TimeUnit.SECONDS)
-                .build()
-
             val requestBody = jsonObject.toString()
                 .toRequestBody("application/json".toMediaTypeOrNull())
 
@@ -184,7 +186,7 @@ suspend fun reportImage(
                 .post(requestBody)
                 .build()
 
-            val response = client.newCall(request).execute()
+            val response = reportClient.newCall(request).execute()
 
             withContext(Dispatchers.Main) {
                 if (response.isSuccessful) {

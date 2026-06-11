@@ -198,61 +198,61 @@ fun ModelListScreen(navController: NavController, modifier: Modifier = Modifier)
     val generationPreferences = remember { GenerationPreferences(context) }
     var currentBaseUrl by remember { mutableStateOf("https://huggingface.co/") }
 
-    var version by remember { mutableIntStateOf(0) }
-    val modelRepository = remember(version) { ModelRepository(context) }
+    val modelRepository = remember { ModelRepository.getInstance(context) }
 
     var showHelpDialog by remember { mutableStateOf(false) }
 
     val isFirstLaunch = remember {
-        val preferences = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
-        val isFirst = preferences.getBoolean("is_first_launch", true)
-        if (isFirst) {
-            preferences.edit { putBoolean("is_first_launch", false) }
-        }
-        isFirst
+        context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+            .getBoolean("is_first_launch", true)
     }
 
-    val downloadState by ModelDownloadService.downloadState.collectAsState()
-
-    LaunchedEffect(downloadState) {
-        when (val state = downloadState) {
-            is ModelDownloadService.DownloadState.Downloading -> {
-                val model = modelRepository.models.find { it.id == state.modelId }
-                if (model != null) {
-                    downloadingModel = model
-                    currentProgress = DownloadProgress(
-                        progress = state.progress,
-                        downloadedBytes = state.downloadedBytes,
-                        totalBytes = state.totalBytes,
-                    )
+    // Collected (not keyed on the state) so a state transition cannot cancel
+    // an in-flight handler: with LaunchedEffect(state) the Success snackbar
+    // was dismissed early when the service reset to Idle two seconds later.
+    LaunchedEffect(Unit) {
+        ModelDownloadService.downloadState.collect { state ->
+            when (state) {
+                is ModelDownloadService.DownloadState.Downloading -> {
+                    val model = modelRepository.models.find { it.id == state.modelId }
+                    if (model != null) {
+                        downloadingModel = model
+                        currentProgress = DownloadProgress(
+                            progress = state.progress,
+                            downloadedBytes = state.downloadedBytes,
+                            totalBytes = state.totalBytes,
+                        )
+                    }
                 }
-            }
 
-            is ModelDownloadService.DownloadState.Extracting -> {
-                val model = modelRepository.models.find { it.id == state.modelId }
-                if (model != null) {
-                    downloadingModel = model
-                    currentProgress = null
+                is ModelDownloadService.DownloadState.Extracting -> {
+                    val model = modelRepository.models.find { it.id == state.modelId }
+                    if (model != null) {
+                        downloadingModel = model
+                        currentProgress = null
+                    }
                 }
-            }
 
-            is ModelDownloadService.DownloadState.Success -> {
-                modelRepository.refreshModelState(state.modelId)
-                downloadingModel = null
-                currentProgress = null
-                snackbarHostState.showSnackbar(msgDownloadDone)
-            }
-
-            is ModelDownloadService.DownloadState.Error -> {
-                downloadingModel = null
-                currentProgress = null
-                downloadError = state.message
-            }
-
-            is ModelDownloadService.DownloadState.Idle -> {
-                if (downloadingModel != null) {
+                is ModelDownloadService.DownloadState.Success -> {
+                    modelRepository.refreshModelState(state.modelId)
                     downloadingModel = null
                     currentProgress = null
+                    // Fire-and-forget so the snackbar's display time does not
+                    // block this collector from seeing further states.
+                    scope.launch { snackbarHostState.showSnackbar(msgDownloadDone) }
+                }
+
+                is ModelDownloadService.DownloadState.Error -> {
+                    downloadingModel = null
+                    currentProgress = null
+                    downloadError = state.message
+                }
+
+                is ModelDownloadService.DownloadState.Idle -> {
+                    if (downloadingModel != null) {
+                        downloadingModel = null
+                        currentProgress = null
+                    }
                 }
             }
         }
@@ -261,11 +261,16 @@ fun ModelListScreen(navController: NavController, modifier: Modifier = Modifier)
     LaunchedEffect(Unit) {
         if (isFirstLaunch) {
             showHelpDialog = true
+            // Written here instead of inside remember: composition may be
+            // discarded, effects only run once it is committed.
+            context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+                .edit { putBoolean("is_first_launch", false) }
         }
         scope.launch {
             currentBaseUrl = generationPreferences.getBaseUrl()
             selectedSource = generationPreferences.getSelectedSource()
         }
+        modelRepository.ensureLoaded()
     }
 
     val cpuModels = remember(modelRepository.models) {
@@ -374,8 +379,8 @@ fun ModelListScreen(navController: NavController, modifier: Modifier = Modifier)
             context = context,
             onDismiss = { showFileManagerDialog = false },
             onFileDeleted = {
-                modelRepository.refreshAllModels()
                 scope.launch {
+                    modelRepository.refreshAllModels()
                     snackbarHostState.showSnackbar(msgFileDeleted)
                 }
             },
@@ -514,8 +519,8 @@ fun ModelListScreen(navController: NavController, modifier: Modifier = Modifier)
                         },
                         onSuccess = {
                             isConverting = false
-                            modelRepository.refreshAllModels()
                             scope.launch {
+                                modelRepository.refreshAllModels()
                                 snackbarHostState.showSnackbar(msgModelConversionSuccess)
                             }
                         },
@@ -557,8 +562,8 @@ fun ModelListScreen(navController: NavController, modifier: Modifier = Modifier)
                         onSuccess = {
                             isConverting = false
                             extractByteProgress = null
-                            modelRepository.refreshAllModels()
                             scope.launch {
+                                modelRepository.refreshAllModels()
                                 snackbarHostState.showSnackbar(msgNpuModelAddedSuccess)
                             }
                         },
@@ -817,7 +822,7 @@ fun ModelListScreen(navController: NavController, modifier: Modifier = Modifier)
 
                     items(
                         items = models,
-                        key = { model -> "${model.id}_$version" },
+                        key = { model -> model.id },
                     ) { model ->
                         ModelCard(
                             model = model,
@@ -867,7 +872,7 @@ fun ModelListScreen(navController: NavController, modifier: Modifier = Modifier)
                         )
                     }
 
-                    if (models.isEmpty()) {
+                    if (models.isEmpty() && modelRepository.isLoaded) {
                         item {
                             var visible by remember { mutableStateOf(false) }
                             LaunchedEffect(Unit) { visible = true }
@@ -1035,7 +1040,7 @@ fun ModelListScreen(navController: NavController, modifier: Modifier = Modifier)
                                                             tempBaseUrl,
                                                         )
                                                         currentBaseUrl = tempBaseUrl
-                                                        version += 1
+                                                        modelRepository.refreshAllModels()
                                                     }
                                                 }
                                             }
@@ -1071,7 +1076,7 @@ fun ModelListScreen(navController: NavController, modifier: Modifier = Modifier)
                                                 generationPreferences.saveBaseUrl(newUrl)
                                                 if (currentBaseUrl != newUrl) {
                                                     currentBaseUrl = newUrl
-                                                    version += 1
+                                                    modelRepository.refreshAllModels()
                                                 }
                                             }
                                         },
@@ -1088,7 +1093,7 @@ fun ModelListScreen(navController: NavController, modifier: Modifier = Modifier)
                                                 generationPreferences.saveBaseUrl(newUrl)
                                                 if (currentBaseUrl != newUrl) {
                                                     currentBaseUrl = newUrl
-                                                    version += 1
+                                                    modelRepository.refreshAllModels()
                                                 }
                                             }
                                         },
@@ -1879,35 +1884,43 @@ private fun FileManagerDialog(context: Context, onDismiss: () -> Unit, onFileDel
     // exposing the cache directory as a fake "file" entry in the list.
     var cacheDir by remember { mutableStateOf<File?>(null) }
     var cacheSize by remember { mutableLongStateOf(0L) }
+    val scope = rememberCoroutineScope()
 
     val msgCacheCleared = stringResource(R.string.cache_cleared)
 
-    fun loadFolders() {
-        val modelsDir = Model.getModelsDir(context)
-        val folders = mutableListOf<Pair<String, Int>>()
+    suspend fun loadFolders() {
+        val folders = withContext(Dispatchers.IO) {
+            val modelsDir = Model.getModelsDir(context)
+            val result = mutableListOf<Pair<String, Int>>()
 
-        if (modelsDir.exists() && modelsDir.isDirectory) {
-            modelsDir.listFiles()?.forEach { modelDir ->
-                if (modelDir.isDirectory) {
-                    val fileCount = modelDir.listFiles()?.size ?: 0
-                    if (fileCount > 0) {
-                        folders.add(Pair(modelDir.name, fileCount))
+            if (modelsDir.exists() && modelsDir.isDirectory) {
+                modelsDir.listFiles()?.forEach { modelDir ->
+                    if (modelDir.isDirectory) {
+                        val fileCount = modelDir.listFiles()?.size ?: 0
+                        if (fileCount > 0) {
+                            result.add(Pair(modelDir.name, fileCount))
+                        }
                     }
                 }
             }
+            result
         }
         modelFolders = folders
         isLoading = false
     }
 
-    fun loadFilesForFolder(folderName: String) {
-        val modelsDir = Model.getModelsDir(context)
-        val folderDir = File(modelsDir, folderName)
-        val all = folderDir.listFiles()?.toList() ?: emptyList()
-        val cd = all.firstOrNull { it.isDirectory && it.name == "cache" }
+    suspend fun loadFilesForFolder(folderName: String) {
+        val (cd, size, files) = withContext(Dispatchers.IO) {
+            val folderDir = File(Model.getModelsDir(context), folderName)
+            val all = folderDir.listFiles()?.toList() ?: emptyList()
+            val cache = all.firstOrNull { it.isDirectory && it.name == "cache" }
+            val cacheBytes =
+                cache?.walkTopDown()?.filter { it.isFile }?.sumOf { it.length() } ?: 0L
+            Triple(cache, cacheBytes, all.filter { it.isFile })
+        }
         cacheDir = cd
-        cacheSize = cd?.walkTopDown()?.filter { it.isFile }?.sumOf { it.length() } ?: 0L
-        folderFiles = all.filter { it.isFile }
+        cacheSize = size
+        folderFiles = files
     }
 
     LaunchedEffect(Unit) {
@@ -1923,12 +1936,15 @@ private fun FileManagerDialog(context: Context, onDismiss: () -> Unit, onFileDel
                 TextButton(
                     onClick = {
                         val fileToDelete = showDeleteConfirm!!
-                        if (fileToDelete.delete()) {
-                            onFileDeleted()
-                            selectedFolder?.let { loadFilesForFolder(it) }
-                            loadFolders()
-                        }
                         showDeleteConfirm = null
+                        scope.launch {
+                            val deleted = withContext(Dispatchers.IO) { fileToDelete.delete() }
+                            if (deleted) {
+                                onFileDeleted()
+                                selectedFolder?.let { loadFilesForFolder(it) }
+                                loadFolders()
+                            }
+                        }
                     },
                     colors = ButtonDefaults.textButtonColors(
                         contentColor = MaterialTheme.colorScheme.error,
@@ -1953,15 +1969,18 @@ private fun FileManagerDialog(context: Context, onDismiss: () -> Unit, onFileDel
             confirmButton = {
                 TextButton(
                     onClick = {
-                        cacheDir?.deleteRecursively()
+                        val dirToClear = cacheDir
                         showClearCacheConfirm = false
-                        Toast.makeText(
-                            context,
-                            msgCacheCleared,
-                            Toast.LENGTH_SHORT,
-                        ).show()
-                        onFileDeleted()
-                        selectedFolder?.let { loadFilesForFolder(it) }
+                        scope.launch {
+                            withContext(Dispatchers.IO) { dirToClear?.deleteRecursively() }
+                            Toast.makeText(
+                                context,
+                                msgCacheCleared,
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                            onFileDeleted()
+                            selectedFolder?.let { loadFilesForFolder(it) }
+                        }
                     },
                     colors = ButtonDefaults.textButtonColors(
                         contentColor = MaterialTheme.colorScheme.error,
@@ -2054,7 +2073,10 @@ private fun FileManagerDialog(context: Context, onDismiss: () -> Unit, onFileDel
                                 Card(
                                     onClick = {
                                         selectedFolder = folderName
-                                        loadFilesForFolder(folderName)
+                                        folderFiles = emptyList()
+                                        cacheDir = null
+                                        cacheSize = 0L
+                                        scope.launch { loadFilesForFolder(folderName) }
                                     },
                                     modifier = Modifier.fillMaxWidth(),
                                     colors = CardDefaults.cardColors(
