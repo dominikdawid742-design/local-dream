@@ -1,0 +1,297 @@
+#ifndef TILING_HPP
+#define TILING_HPP
+
+#include <stdexcept>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include <xtensor/xarray.hpp>
+#include <xtensor/xbuilder.hpp>
+#include <xtensor/xeval.hpp>
+#include <xtensor/xmanipulation.hpp>
+#include <xtensor/xmath.hpp>
+#include <xtensor/xrandom.hpp>
+#include <xtensor/xview.hpp>
+
+#include "Config.hpp"
+
+// QnnModel graph execution sizes its IO from the global output_/sample_
+// dimensions in Config.hpp. Tiled VAE passes run the fixed-size tile graph
+// while the request-level dimensions describe the full image, so the globals
+// must be temporarily swapped to tile size. This guard restores them on every
+// exit path.
+struct ScopedSizeOverride {
+  ScopedSizeOverride(int new_output_w, int new_output_h, int new_sample_w,
+                     int new_sample_h)
+      : output_w_(output_width),
+        output_h_(output_height),
+        sample_w_(sample_width),
+        sample_h_(sample_height) {
+    output_width = new_output_w;
+    output_height = new_output_h;
+    sample_width = new_sample_w;
+    sample_height = new_sample_h;
+  }
+  ~ScopedSizeOverride() {
+    output_width = output_w_;
+    output_height = output_h_;
+    sample_width = sample_w_;
+    sample_height = sample_h_;
+  }
+  ScopedSizeOverride(const ScopedSizeOverride &) = delete;
+  ScopedSizeOverride &operator=(const ScopedSizeOverride &) = delete;
+
+ private:
+  int output_w_, output_h_, sample_w_, sample_h_;
+};
+
+// Evenly spreads tiles of `tile_size` across `dimension` with at least
+// `min_overlap` between neighbours; the last tile is clamped to the edge.
+inline std::vector<int> calculate_tile_positions(int dimension, int tile_size,
+                                                 int min_overlap) {
+  if (dimension <= tile_size) {
+    return {0};
+  }
+
+  int num_tiles = 1;
+  int effective_tile_size = tile_size - min_overlap;
+  if (dimension > tile_size) {
+    num_tiles +=
+        (dimension - tile_size + effective_tile_size - 1) / effective_tile_size;
+  }
+
+  std::vector<int> positions;
+  positions.reserve(num_tiles);
+  positions.push_back(0);
+
+  if (num_tiles == 1) {
+    return positions;
+  }
+
+  int total_distance = dimension - tile_size;
+  int num_strides = num_tiles - 1;
+
+  int base_stride = total_distance / num_strides;
+  int remainder = total_distance % num_strides;
+
+  int current_pos = 0;
+  for (int i = 0; i < num_strides; ++i) {
+    int stride = base_stride + (i < remainder ? 1 : 0);
+    current_pos += stride;
+    positions.push_back(current_pos);
+  }
+
+  positions.back() = dimension - tile_size;
+
+  return positions;
+}
+
+// Calculate tile positions and overlaps for VAE encoder/decoder.
+// Returns: {pixel_positions, latent_positions, pixel_overlap_x,
+// pixel_overlap_y, latent_overlap_x, latent_overlap_y}
+inline std::tuple<std::vector<std::pair<int, int>>,
+                  std::vector<std::pair<int, int>>, int, int, int, int>
+calculate_vae_tile_positions(int pixel_width, int pixel_height) {
+  const int vae_tile_size = 512;        // Fixed VAE tile size in pixel space
+  const int vae_latent_tile_size = 64;  // Fixed VAE tile size in latent space
+  const int min_latent_overlap = 16;    // Minimum overlap in latent space
+  const int scale_factor = 8;           // VAE scale: 512/64 = 8
+
+  auto pixel_x_coords = calculate_tile_positions(
+      pixel_width, vae_tile_size, min_latent_overlap * scale_factor);
+  auto pixel_y_coords = calculate_tile_positions(
+      pixel_height, vae_tile_size, min_latent_overlap * scale_factor);
+
+  std::vector<int> latent_x_coords;
+  std::vector<int> latent_y_coords;
+  for (int px : pixel_x_coords) {
+    latent_x_coords.push_back(px / scale_factor);
+  }
+  for (int py : pixel_y_coords) {
+    latent_y_coords.push_back(py / scale_factor);
+  }
+
+  std::vector<std::pair<int, int>> pixel_positions;
+  std::vector<std::pair<int, int>> latent_positions;
+
+  for (int py : pixel_y_coords) {
+    for (int px : pixel_x_coords) {
+      pixel_positions.push_back({px, py});
+    }
+  }
+
+  for (int ly : latent_y_coords) {
+    for (int lx : latent_x_coords) {
+      latent_positions.push_back({lx, ly});
+    }
+  }
+
+  int pixel_overlap_x = 0;
+  int latent_overlap_x = 0;
+  int pixel_overlap_y = 0;
+  int latent_overlap_y = 0;
+
+  if (pixel_x_coords.size() > 1) {
+    pixel_overlap_x = vae_tile_size - (pixel_x_coords[1] - pixel_x_coords[0]);
+    latent_overlap_x =
+        vae_latent_tile_size - (latent_x_coords[1] - latent_x_coords[0]);
+  }
+
+  if (pixel_y_coords.size() > 1) {
+    pixel_overlap_y = vae_tile_size - (pixel_y_coords[1] - pixel_y_coords[0]);
+    latent_overlap_y =
+        vae_latent_tile_size - (latent_y_coords[1] - latent_y_coords[0]);
+  }
+
+  return {pixel_positions, latent_positions, pixel_overlap_x,
+          pixel_overlap_y, latent_overlap_x, latent_overlap_y};
+}
+
+// Per-tile blend weight: linear fade-in over half the overlap on every edge
+// that has a neighbouring tile (interior edges only; image borders stay 1.0).
+inline xt::xarray<float> make_tile_fade_weight(int tile_size, int x, int y,
+                                               int extent_w, int extent_h,
+                                               int fade_size_x,
+                                               int fade_size_y) {
+  xt::xarray<float> tile_weight = xt::ones<float>({tile_size, tile_size});
+
+  if (fade_size_y > 0) {
+    if (y > 0) {
+      for (int i = 0; i < fade_size_y; ++i) {
+        float alpha = (float)(i + 1) / fade_size_y;
+        xt::view(tile_weight, i, xt::all()) *= alpha;
+      }
+    }
+    if (y + tile_size < extent_h) {
+      for (int i = 0; i < fade_size_y; ++i) {
+        float alpha = (float)(i + 1) / fade_size_y;
+        xt::view(tile_weight, tile_size - 1 - i, xt::all()) *= alpha;
+      }
+    }
+  }
+
+  if (fade_size_x > 0) {
+    if (x > 0) {
+      for (int i = 0; i < fade_size_x; ++i) {
+        float alpha = (float)(i + 1) / fade_size_x;
+        xt::view(tile_weight, xt::all(), i) *= alpha;
+      }
+    }
+    if (x + tile_size < extent_w) {
+      for (int i = 0; i < fade_size_x; ++i) {
+        float alpha = (float)(i + 1) / fade_size_x;
+        xt::view(tile_weight, xt::all(), tile_size - 1 - i) *= alpha;
+      }
+    }
+  }
+
+  return tile_weight;
+}
+
+inline xt::xarray<float> blend_vae_encoder_tiles(
+    const std::vector<std::pair<xt::xarray<float>, xt::xarray<float>>>
+        &tiles_mean_std,
+    const std::vector<std::pair<int, int>> &positions, int latent_h,
+    int latent_w, int tile_size, int overlap_x, int overlap_y) {
+  if (tiles_mean_std.empty()) {
+    throw std::runtime_error(
+        "Tile list cannot be empty for VAE encoder blending.");
+  }
+
+  std::vector<int> accumulated_shape = {1, 4, latent_h, latent_w};
+  xt::xarray<float> accumulated_mean = xt::zeros<float>(accumulated_shape);
+  xt::xarray<float> accumulated_std = xt::zeros<float>(accumulated_shape);
+  xt::xarray<float> weight_map = xt::zeros<float>({latent_h, latent_w});
+
+  int fade_size_x = overlap_x / 2;
+  int fade_size_y = overlap_y / 2;
+
+  for (size_t idx = 0; idx < tiles_mean_std.size(); ++idx) {
+    int x = positions[idx].first;
+    int y = positions[idx].second;
+
+    xt::xarray<float> tile_weight = make_tile_fade_weight(
+        tile_size, x, y, latent_w, latent_h, fade_size_x, fade_size_y);
+
+    const auto &mean_tile =
+        tiles_mean_std[idx].first;  // (1, 4, tile_size, tile_size)
+    const auto &std_tile =
+        tiles_mean_std[idx].second;  // (1, 4, tile_size, tile_size)
+
+    for (int c = 0; c < 4; ++c) {
+      auto acc_mean_slice =
+          xt::view(accumulated_mean, 0, c, xt::range(y, y + tile_size),
+                   xt::range(x, x + tile_size));
+      auto mean_slice = xt::view(mean_tile, 0, c, xt::all(), xt::all());
+      acc_mean_slice += mean_slice * tile_weight;
+
+      auto acc_std_slice =
+          xt::view(accumulated_std, 0, c, xt::range(y, y + tile_size),
+                   xt::range(x, x + tile_size));
+      auto std_slice = xt::view(std_tile, 0, c, xt::all(), xt::all());
+      acc_std_slice += std_slice * tile_weight;
+    }
+
+    auto weight_slice = xt::view(weight_map, xt::range(y, y + tile_size),
+                                 xt::range(x, x + tile_size));
+    weight_slice += tile_weight;
+  }
+
+  weight_map = xt::maximum(weight_map, 1e-8f);
+  xt::xarray<float> weight_expanded =
+      xt::reshape_view(weight_map, {1, 1, latent_h, latent_w});
+
+  xt::xarray<float> final_mean = accumulated_mean / weight_expanded;
+  xt::xarray<float> final_std = accumulated_std / weight_expanded;
+
+  xt::xarray<float> noise =
+      xt::random::randn<float>({1, 4, latent_h, latent_w});
+  xt::xarray<float> latent = xt::eval(final_mean + final_std * noise);
+
+  return latent;
+}
+
+inline xt::xarray<float> blend_vae_output_tiles(
+    const std::vector<xt::xarray<float>> &tiles,
+    const std::vector<std::pair<int, int>> &positions, int output_h,
+    int output_w, int tile_size, int overlap_x, int overlap_y) {
+  if (tiles.empty()) {
+    throw std::runtime_error(
+        "Tile list cannot be empty for VAE output blending.");
+  }
+
+  std::vector<int> accumulated_shape = {1, 3, output_h, output_w};
+  xt::xarray<float> accumulated = xt::zeros<float>(accumulated_shape);
+  xt::xarray<float> weight_map = xt::zeros<float>({output_h, output_w});
+
+  int fade_size_x = overlap_x / 2;
+  int fade_size_y = overlap_y / 2;
+
+  for (size_t idx = 0; idx < tiles.size(); ++idx) {
+    int x = positions[idx].first;
+    int y = positions[idx].second;
+
+    xt::xarray<float> tile_weight = make_tile_fade_weight(
+        tile_size, x, y, output_w, output_h, fade_size_x, fade_size_y);
+
+    for (int c = 0; c < 3; ++c) {
+      auto acc_slice = xt::view(accumulated, 0, c, xt::range(y, y + tile_size),
+                                xt::range(x, x + tile_size));
+      auto tile_slice = xt::view(tiles[idx], 0, c, xt::all(), xt::all());
+      acc_slice += tile_slice * tile_weight;
+    }
+
+    auto weight_slice = xt::view(weight_map, xt::range(y, y + tile_size),
+                                 xt::range(x, x + tile_size));
+    weight_slice += tile_weight;
+  }
+
+  weight_map = xt::maximum(weight_map, 1e-8f);
+  xt::xarray<float> weight_expanded =
+      xt::reshape_view(weight_map, {1, 1, output_h, output_w});
+
+  return accumulated / weight_expanded;
+}
+
+#endif  // TILING_HPP
