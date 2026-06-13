@@ -43,7 +43,6 @@ import androidx.core.content.edit
 import androidx.navigation.NavController
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
-import coil.size.Size
 import io.github.xororz.localdream.BuildConfig
 import io.github.xororz.localdream.R
 import io.github.xororz.localdream.data.DownloadProgress
@@ -807,6 +806,10 @@ fun prepareRuntimeDir(context: Context): File {
     return runtimeDir
 }
 
+// Longest-side cap for previewing high-res images. 4096 is the universal max GPU texture
+// size, and 4096^2 * 4 = 67MB stays under the hardware Canvas ~100MB per-bitmap limit.
+private const val MAX_DISPLAY_DIMENSION = 4096
+
 @Composable
 fun ZoomableImage(
     imageUri: Uri?,
@@ -835,8 +838,14 @@ fun ZoomableImage(
             .data(imageUri)
             .apply {
                 if (useOriginalSize) {
-                    size(Size.ORIGINAL)
-                    memoryCacheKey(imageUri.toString() + "_original")
+                    // Cap the decoded preview to MAX_DISPLAY_DIMENSION on the long side.
+                    // A hardware Canvas refuses to draw bitmaps over ~100MB
+                    // (RecordingCanvas: "trying to draw too large bitmap"), and an upscaled
+                    // result can easily exceed that (e.g. 5760x5760 = 132MB). The cap keeps
+                    // the preview under the Canvas/GPU-texture limit while staying sharp under
+                    // zoom; saving still uses the full-resolution bitmap.
+                    size(MAX_DISPLAY_DIMENSION, MAX_DISPLAY_DIMENSION)
+                    memoryCacheKey(imageUri.toString() + "_display")
                 }
             }
             .build()
