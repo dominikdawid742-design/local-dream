@@ -1018,63 +1018,86 @@ inline GenerationResult Pipeline::generate(
       // Gaussian component into the predicted noise. The deterministic
       // inversion + deterministic reverse pair is nearly reconstructive
       // (especially at cfg = 1 with few-step models), which over-smooths;
-      // 5% spherical randomness flattens the output distribution and
+      // a little spherical randomness flattens the output distribution and
       // restores high-frequency detail. Slerp (not lerp) keeps the noise
-      // norm on the Gaussian shell the scheduler expects. The paper warns
-      // this accumulates error over long multi-step runs - intended for
-      // few-step (distilled) ultrafix use.
-      if (req.ultrafix) {
-        const float kInjectionLambda = 0.95f;  // weight on the prediction
-        xt::xarray<float> rand_noise = xt::random::randn<float>(shape);
-        const float *a = noise_pred.data();
-        const float *b = rand_noise.data();
-        double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
-        const size_t count = noise_pred.size();
-        for (size_t k = 0; k < count; ++k) {
-          dot += (double)a[k] * b[k];
-          norm_a += (double)a[k] * a[k];
-          norm_b += (double)b[k] * b[k];
-        }
-        const double denom = std::sqrt(norm_a) * std::sqrt(norm_b);
-        if (denom > 0.0) {
-          const double cos_omega = std::clamp(dot / denom, -0.999999, 0.999999);
-          const double omega = std::acos(cos_omega);
-          const double sin_omega = std::sin(omega);
-          const float w_pred =
-              (float)(std::sin(kInjectionLambda * omega) / sin_omega);
-          const float w_rand =
-              (float)(std::sin((1.0 - kInjectionLambda) * omega) / sin_omega);
-          noise_pred = xt::eval(w_pred * noise_pred + w_rand * rand_noise);
+      // norm on the Gaussian shell the scheduler expects.
+      //
+      // The injection amount is scheduled as the time-mirror of the low-freq
+      // skip residual below: near-zero at high noise (structure phase, where
+      // injected randomness would only fight the structure lock) and ramping
+      // up toward the low-noise detail phase, where the detail it adds
+      // belongs. The very last step is skipped entirely: its injected noise
+      // has no subsequent step to resolve it and would land as grain in the
+      // final image.
+      const bool is_last_step = (i + 1 >= (int)timesteps.size());
+      if (req.ultrafix && !is_last_step) {
+        // cosine is ~1 at high noise, ~0 at low noise; (1 - cosine) ramps
+        // injection in over the detail phase. kInjectMax caps the random
+        // share so the prediction always dominates.
+        const float kInjectMax = 0.08f;  // peak random share (lambda floor)
+        float cosine =
+            0.5f *
+            (1.0f + std::cos(3.14159265f * (1000.0f - current_ts) / 1000.0f));
+        float inject = kInjectMax * (1.0f - cosine);
+        if (inject > 0.005f) {
+          const float lambda = 1.0f - inject;  // weight on the prediction
+          xt::xarray<float> rand_noise = xt::random::randn<float>(shape);
+          const float *a = noise_pred.data();
+          const float *b = rand_noise.data();
+          double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
+          const size_t count = noise_pred.size();
+          for (size_t k = 0; k < count; ++k) {
+            dot += (double)a[k] * b[k];
+            norm_a += (double)a[k] * a[k];
+            norm_b += (double)b[k] * b[k];
+          }
+          const double denom = std::sqrt(norm_a) * std::sqrt(norm_b);
+          if (denom > 0.0) {
+            const double cos_omega =
+                std::clamp(dot / denom, -0.999999, 0.999999);
+            const double omega = std::acos(cos_omega);
+            const double sin_omega = std::sin(omega);
+            const float w_pred = (float)(std::sin(lambda * omega) / sin_omega);
+            const float w_rand =
+                (float)(std::sin((1.0 - lambda) * omega) / sin_omega);
+            noise_pred = xt::eval(w_pred * noise_pred + w_rand * rand_noise);
+          }
         }
       }
 
       latents = scheduler->step(noise_pred, timesteps(i), latents).prev_sample;
 
-      // Ultrafix skip-residual anchor: over the structural (early) portion
-      // of the remaining steps, blend the renoised original latent back in
-      // with a cosine-decaying weight. Composition is decided at high noise,
-      // so this pins the global structure to the base image (tiles cannot
-      // grow new prompt subjects) while the low-noise detail steps run
-      // unconstrained. Same idea as the per-step inpaint blend below, with
-      // the spatial mask replaced by a time-decaying scalar.
-      // if (req.ultrafix && i + 1 < (int)timesteps.size()) {
-      //   const float kAnchorFrac = 0.5f;  // anchored share of remaining steps
-      //   int anchor_steps =
-      //       (int)(((int)timesteps.size() - start_step) * kAnchorFrac);
-      //   int steps_done = i - start_step + 1;
-      //   if (steps_done < anchor_steps) {
-      //     float progress = (float)steps_done / (float)anchor_steps;
-      //     float cos_half = std::cos(progress * 1.5707963f);  // pi/2
-      //     float anchor_weight = cos_half * cos_half;
-      //     // The scheduler step above moved `latents` to the next timestep's
-      //     // noise level; renoise the original to that same level.
-      //     xt::xarray<int> t_next = {(int)(timesteps(i + 1))};
-      //     xt::xarray<float> orig_noised =
-      //         scheduler->add_noise(original_latents, latents_noise, t_next);
-      //     latents = xt::eval(anchor_weight * orig_noised +
-      //                        (1.0f - anchor_weight) * latents);
-      //   }
-      // }
+      // Ultrafix low-frequency skip residual: pull only the LOW-frequency
+      // band of the latent back toward the inversion trajectory, leaving
+      // high frequencies (the detail this pass is meant to add) untouched.
+      // add_noise(z0, eps_inv, t) reproduces the faithful-reconstruction
+      // latent at the next noise level; blurring both and nudging by the
+      // low-band difference (latents += w * (blur(orig) - blur(latents)))
+      // locks global structure/composition to the base image -- tiles cannot
+      // grow new prompt subjects -- without the detail loss of the full-band
+      // anchor (HiWave's wavelet structure-guidance, applied in latent
+      // space). The weight follows PixelRush's c2 cosine over the full
+      // timestep range, so the lock is strong at high noise (structure phase)
+      // and gone by the low-noise detail steps.
+      if (req.ultrafix && i + 1 < (int)timesteps.size()) {
+        const float kStructFrac = 0.3f;  // exponent on the cosine decay
+        float cosine =
+            0.5f *
+            (1.0f + std::cos(3.14159265f * (1000.0f - current_ts) / 1000.0f));
+        float w = std::pow(cosine, kStructFrac);
+        if (w > 0.02f) {
+          xt::xarray<int> t_next = {(int)(timesteps(i + 1))};
+          xt::xarray<float> orig_noised =
+              scheduler->add_noise(original_latents, latents_noise, t_next);
+          // Radius ~ a UNet tile eighth: large enough to be "global structure"
+          // relative to the full latent, cheap enough to run each step.
+          const int blur_radius = std::max(2, (req.ultrafix_tile / 8) / 16);
+          xt::xarray<float> lf_orig =
+              gaussian_blur_latent(orig_noised, blur_radius);
+          xt::xarray<float> lf_cur = gaussian_blur_latent(latents, blur_radius);
+          latents = xt::eval(latents + w * (lf_orig - lf_cur));
+        }
+      }
 
       if (req.has_mask) {
         xt::xarray<int> t_xt = {(int)(timesteps(i))};

@@ -2,6 +2,7 @@
 #define TILING_HPP
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
@@ -15,6 +16,69 @@
 #include <xtensor/xview.hpp>
 
 #include "Config.hpp"
+
+// Separable Gaussian blur over the spatial dims of a [1, C, H, W] latent,
+// with edge replication at the borders. Used to split a latent into its
+// low-frequency (blurred) and high-frequency (residual) bands. `radius` is
+// in latent cells; `sigma <= 0` derives a sigma from the radius.
+inline xt::xarray<float> gaussian_blur_latent(const xt::xarray<float> &input,
+                                              int radius, float sigma = -1.0f) {
+  if (radius < 1) return input;
+  const int channels = static_cast<int>(input.shape()[1]);
+  const int height = static_cast<int>(input.shape()[2]);
+  const int width = static_cast<int>(input.shape()[3]);
+  if (sigma <= 0.0f) sigma = static_cast<float>(radius) / 2.0f;
+
+  std::vector<float> kernel(2 * radius + 1);
+  float ksum = 0.0f;
+  for (int i = -radius; i <= radius; ++i) {
+    float v = std::exp(-static_cast<float>(i * i) / (2.0f * sigma * sigma));
+    kernel[i + radius] = v;
+    ksum += v;
+  }
+  for (float &v : kernel) v /= ksum;
+
+  xt::xarray<float> tmp = xt::zeros<float>({1, channels, height, width});
+  xt::xarray<float> out = xt::zeros<float>({1, channels, height, width});
+  const float *src = input.data();
+  float *mid = tmp.data();
+  float *dst = out.data();
+
+  auto clampi = [](int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+  };
+
+  for (int c = 0; c < channels; ++c) {
+    const size_t plane = static_cast<size_t>(c) * height * width;
+    // Horizontal pass: src -> mid.
+    for (int y = 0; y < height; ++y) {
+      const float *row = src + plane + static_cast<size_t>(y) * width;
+      float *row_out = mid + plane + static_cast<size_t>(y) * width;
+      for (int x = 0; x < width; ++x) {
+        float acc = 0.0f;
+        for (int i = -radius; i <= radius; ++i) {
+          acc += kernel[i + radius] * row[clampi(x + i, 0, width - 1)];
+        }
+        row_out[x] = acc;
+      }
+    }
+    // Vertical pass: mid -> dst.
+    for (int y = 0; y < height; ++y) {
+      float *row_out = dst + plane + static_cast<size_t>(y) * width;
+      for (int x = 0; x < width; ++x) {
+        float acc = 0.0f;
+        for (int i = -radius; i <= radius; ++i) {
+          acc += kernel[i + radius] *
+                 mid[plane +
+                     static_cast<size_t>(clampi(y + i, 0, height - 1)) * width +
+                     x];
+        }
+        row_out[x] = acc;
+      }
+    }
+  }
+  return out;
+}
 
 // QnnModel graph execution sizes its IO from the global output_/sample_
 // dimensions in Config.hpp. Tiled VAE passes run the fixed-size tile graph
@@ -105,12 +169,10 @@ calculate_vae_tile_positions(int pixel_width, int pixel_height,
   const int vae_latent_tile_size = vae_tile_size / scale_factor;
   const int min_latent_overlap = vae_latent_tile_size / 4;
 
-  auto latent_x_coords =
-      calculate_tile_positions(pixel_width / scale_factor,
-                               vae_latent_tile_size, min_latent_overlap);
-  auto latent_y_coords =
-      calculate_tile_positions(pixel_height / scale_factor,
-                               vae_latent_tile_size, min_latent_overlap);
+  auto latent_x_coords = calculate_tile_positions(
+      pixel_width / scale_factor, vae_latent_tile_size, min_latent_overlap);
+  auto latent_y_coords = calculate_tile_positions(
+      pixel_height / scale_factor, vae_latent_tile_size, min_latent_overlap);
 
   std::vector<std::pair<int, int>> pixel_positions;
   std::vector<std::pair<int, int>> latent_positions;
