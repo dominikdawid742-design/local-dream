@@ -1180,7 +1180,7 @@ inline GenerationResult Pipeline::generate(
         std::cout << "NSFW Score: " << score << std::endl;
         if (score > nsfw_threshold_) {
           QNN_WARN("NSFW detected (%.2f>%.2f).", score, nsfw_threshold_);
-          std::fill(out_data.begin(), out_data.end(), 255);
+          // std::fill(out_data.begin(), out_data.end(), 255);
         }
       } else {
         QNN_WARN("Safety check failed.");
