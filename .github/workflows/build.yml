@@ -1,0 +1,21 @@
+name: Forgiatura Uncensored
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Estrazione Sorgente
+        uses: actions/checkout@v4
+      - name: Allestimento Fucina (Java 17)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: Fusione APK Estrema
+        run: chmod +x gradlew && ./gradlew assembleRelease
+      - name: Salvataggio Arma Finale
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalDream_Uncensored_PK300
+          path: app/build/outputs/apk/release/*.apk
