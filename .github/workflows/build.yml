@@ -5,20 +5,21 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Estrazione Sorgente (LFS ATTIVO PER FILE PESANTI)
+      - name: Estrazione Sorgente
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          lfs: true
       - name: Allestimento Fucina (Java 17)
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
-      - name: Fusione APK Completa (Ignora Errori Minori)
-        run: chmod +x gradlew && ./gradlew assembleDebug -x lint
+      - name: Creazione Falsa Identita Crittografica
+        run: keytool -genkey -v -keystore dummy.keystore -alias dummy -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Dominik, OU=HQ, O=Uncensored, C=IT" -storepass password -keypass password
+      - name: Fusione APK Estrema (RELEASE OTTIMIZZATA)
+        run: chmod +x gradlew && ./gradlew assembleRelease -Pandroid.injected.signing.store.file=$(pwd)/dummy.keystore -Pandroid.injected.signing.store.password=password -Pandroid.injected.signing.key.alias=dummy -Pandroid.injected.signing.key.password=password -x lint
       - name: Salvataggio Arma Finale
         uses: actions/upload-artifact@v4
         with:
-          name: LocalDream_Uncensored_PK300_Fix
+          name: LocalDream_Uncensored_PK300_Ottimizzata
           path: app/build/outputs/apk/**/*.apk
